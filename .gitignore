@@ -1,0 +1,86 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# --- IDE / editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursorignore.local
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- 大模型权重（仓库不放权重，防止误提交） ---
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.gguf
+
+# --- 导出 / 分析产物 ---
+# output/ 下的 README.md、*.jpg 等说明文件需要跟踪，
+# 这里只拦生成的 ONNX 子图与流量分析报表。
+*.onnx
+*.onnx_data
+*.onnx.data
+
+# 流量统计
+*.flow_stats.tsv
+*.flow_stats.summary.json
+onnx_flow_stats_multi.xlsx
+onnx_flow_stats_multi.json
+
+# 导出统计（与每个 phase 子目录绑定，不在仓库内单独维护）
+output/**/onnx_stats.json
+output/**/layer_*.json
+
+# 临时输出根目录（用户用 --output_dir 起的非默认位置，自行排除即可）
+*.tmp
+tmp/
+temp/
+
+# --- 日志 ---
+*.log
+
+# --- 打包产物 ---
+*.tar
+*.tar.gz
+*.zip
