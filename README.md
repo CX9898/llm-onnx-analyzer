@@ -1,4 +1,4 @@
-# onnx_export_analysis
+# llm-onnx-analyzer
 
 面向真实大模型权重的 ONNX 导出与流程分析工具集：把目标模型按 canonical 路径切成一组贴近真实执行语义的代表层 merged ONNX 子图，并对其做逐节点 MACs / 显存 / 参数占比统计。
 
