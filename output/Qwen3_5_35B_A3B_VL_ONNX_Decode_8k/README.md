@@ -1,96 +1,154 @@
-# Qwen3.5-MoE-VL Merged ONNX 说明：`decode`
+# Qwen3.5-35B-A3B VL — Decode 8K KV ONNX 图清单与阅读顺序
 
-这个目录保存的是 `Qwen3.5-35B-A3B`（多模态完整版）一套面向 `8k decode` 的代表层 merged ONNX 子图与统计文件。
+本目录是 `Qwen3.5-35B-A3B-VL` **decode 阶段（单 token 自回归）** 的代表性 ONNX 导出。
+源码对应：`transformers/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`。
 
-## 完整数据流（按这个顺序看 onnx）
+- 单步 token：`seq_len = 1`
+- KV 历史长度：`decode_context_len = 8192`
+- 文件总数：**9**；总 `unk__N`：**0**（decode 阶段无视觉/`masked_scatter` 路径，无源码本征数据依赖）
 
-下图覆盖本目录所有主链 onnx 文件，箭头方向就是 decode 单步 forward 时数据流的方向；列在右侧的 `*.onnx` 就是每一步对应的产物文件名。
+---
 
-```text
-[Decode — 每步只前进 1 个新 token，历史信息全部走 KV-cache / recurrent state]
+## 1. 阅读顺序（按源码 `forward` pass 自上而下）
 
-  input_ids:[1,1]i64
-        │
-        ▼  embedding_1.onnx
-  inputs_embeds:[1,1,2048]bf16
-        │
-        │   ×40 层 decoder stack (layer_idx % 4 == 3 → full attention, 否则 linear attention)
-        │   本目录只导出两类代表层:
-        │
-        │     layer 0 (linear attn + MoE):
-        │       ─► layer_00_linear_attn_block.onnx
-        │            states (in/out): conv_state:[1,8192,4]bf16,
-        │                             recurrent_state:[1,32,128,128]float32
-        │       ─► layer_00_moe_block_1.onnx
-        │
-        │     layer 3 (full attn + MoE):
-        │       ─► layer_03_full_attn_block_decode_ctx8k.onnx
-        │            cache (in/out): past_key/past_value:[1,2,8192,256]bf16
-        │            attention_mask:[1,1,1,8193]bf16
-        │       ─► layer_03_moe_block_1.onnx
-        │
-        ▼  norm_1.onnx
-  hidden_states:[1,1,2048]bf16
-        │
-        ▼  lm_head_1.onnx
-  logits:[1,1,248320]bf16
+decode 比 prefill 简单——视觉塔已在 prefill 时跑完并把 image embeddings 写入 KV，每一步 decode 只需要：
+1. embed 当前新 token（1 个）
+2. 重新构造 M-RoPE 3D `position_ids`（因为 KV 历史在每步都增长）
+3. 走文本解码层（吃 `past_key/past_value`，吐 `new_key/new_value`）
+4. 输出 logits
+
+```
+input_ids[1, 1] ──→ embedding_1 ──→ hidden_states[1, 1, 2048] ─┐
+                                                                  │
+attention_mask, rope_deltas ──→ mrope_position_ids_decode_ctx8k   │
+                              ──→ position_ids[3, 1, 1] ───┐      │
+                                                            │      │
+            ┌───────────────────────────────────────────────┴──────┴────┐
+            │ Stage: 文本解码层（代表 linear@layer 0、full@layer 3）       │
+            │   layer_00_linear_attn_block          ←─ 代表 linear-attn   │
+            │     └─ 内部子图：layer_00_..._RecurrentGatedDeltaRule        │
+            │   layer_00_moe_block_1                                      │
+            │   ... 真实 47 + 1 层 ...                                     │
+            │   layer_03_full_attn_block_decode_ctx8k    ←─ 代表 full-attn │
+            │   layer_03_moe_block_1                                       │
+            └─────────────────────────────────────────────────────────────┘
+                                       ↓
+                               norm_1 → lm_head_1 → logits[1, 1, 248320]
 ```
 
-主链之外，本目录还导出一张 **custom op 展开参考子图**（不是独立调用步骤，只是 `layer_00_linear_attn_block.onnx` 顶层图里 `qwen_onnx::RecurrentGatedDeltaRule` 的内部展开，方便结构对照）：
+---
 
-- `layer_00_linear_attn_block_RecurrentGatedDeltaRule.onnx`
+## 2. 完整文件清单（按读法顺序）
 
-> 注：vision tower 与 `mm_inject` **不在本目录**。多模态输入的视觉特征已在 prefill 阶段经 `mm_inject_8k.onnx` 一次性写进 `inputs_embeds` 并通过 KV-cache 落到缓存里，decode 阶段不会再触发任何 vision/mm 图。完整的 vision 数据流请查阅 [`Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k/README.md`](../Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k/README.md)。
+| # | 文件 | 算子分组 | 输入 | 输出 | 节点 | unk |
+|---|---|---|---|---|---|---|
+| **Stage 1：embedding 与 M-RoPE** ||||||||
+| 1 | `embedding_1.onnx` | `get_input_embeddings()(input_ids)`（line 1762） | `input_ids: i64[1, 1]`、`embedding_weight: bf16[248320, 2048]` | `hidden_states: bf16[1, 1, 2048]` | 1 | 0 |
+| 2 | `mrope_position_ids_decode_ctx8k.onnx` | `compute_3d_position_ids` elif 分支（line 1720-1726） | `attention_mask: i64[1, 8193]`、`rope_deltas: i64[1, 1]` | `position_ids: i64[3, 1, 8193]` | 11 | 0 |
+| **Stage 2：解码层（代表性）** ||||||||
+| 3 | `layer_00_linear_attn_block.onnx` | linear-attn 层包装（含 q/k/v/g/beta + recurrent core） | `hidden_states.1: bf16[1, 1, 2048]`、`conv_state`、`recurrent_state`、`padding_mask` | `hidden_states: bf16[1, 1, 2048]`、`new_conv_state`、`new_recurrent_state` | 93 | 0 |
+| 4 | `layer_00_linear_attn_block_RecurrentGatedDeltaRule.onnx` | linear-attn 主体（recurrent step） | q/k/v/g/beta + recurrent_state | `core_out`、`new_recurrent_state` | 47 | 0 |
+| 5 | `layer_00_moe_block_1.onnx` | layer 0 配对 MoE | hidden + experts + shared | `hidden_states: bf16[1, 1, 2048]` | 50 | 0 |
+| 6 | `layer_03_full_attn_block_decode_ctx8k.onnx` | full-attn 层（M-RoPE 3D + KV-cache） | `hidden_states.1`、**`position_ids: i64[3, 1, 1]`**、`attention_mask: bf16[1, 1, 1, 8193]`、`past_key/past_value: bf16[1, 2, 8192, 256]` | `hidden_states`、`new_key/new_value: bf16[1, 2, 8193, 256]` | 136 | 0 |
+| 7 | `layer_03_moe_block_1.onnx` | layer 3 配对 MoE | 同 #5 | `hidden_states` | 50 | 0 |
+| **Stage 3：输出头** ||||||||
+| 8 | `norm_1.onnx` | `Qwen3_5MoeRMSNorm` | `hidden_states: bf16[1, 1, 2048]` | `output: bf16[1, 1, 2048]` | 11 | 0 |
+| 9 | `lm_head_1.onnx` | `lm_head` 线性投影 | `hidden_states`、`lm_head_weight: bf16[248320, 2048]` | `logits: bf16[1, 1, 248320]` | 2 | 0 |
 
-## 先看结论
+---
 
-- `decode` 的意思是：每一步只处理 `1` 个新 token，但携带历史状态继续递推；多模态输入（图像 / 视频）的 visual feature 已在 prefill 阶段一次性计算并通过 KV-cache 隐式带入。
-- **decode 阶段不导出 vision tower 与 mm_inject 子图**：图像 token 早在 prefill 阶段就被 `masked_scatter` 写入了 `inputs_embeds`，并通过 KV-cache 把对应位置的 K/V 落在缓存里；decode 步是逐 token 自回归，不会再触发 `vision_patch_embed` / `vision_block` / `vision_patch_merger` / `mm_inject` 中的任何一个图。完整的 vision 数据流请查阅 prefill 目录 [`Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k/README.md`](../Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k/README.md)。
-- 因此本目录最值得关注的就是 **代表层 text 主链 4 张图**（与 `Qwen3_5_35B_A3B_ONNX_Decode_8k` 在算子和权重层面完全等价）：
-  - `layer_00_linear_attn_block.onnx`
-  - `layer_00_moe_block_1.onnx`
-  - `layer_03_full_attn_block_decode_ctx8k.onnx`
-  - `layer_03_moe_block_1.onnx`
-- 顶层加载类是 `Qwen3_5MoeForConditionalGeneration`；text 侧子图通过 `model.model.language_model` 取 backbone，与纯文本路径同构。
+## 3. 数据流连接边（生产者 → 消费者）
 
-## 目录在整模型里代表什么
+| 张量 | dtype × shape | 生产者 | 消费者 |
+|---|---|---|---|
+| `hidden_states` | bf16 [1, 1, 2048] | `embedding_1` | 第一个 layer block（`hidden_states.1`） |
+| `position_ids` | **i64 [3, 1, 1]**（M-RoPE 3D） | `mrope_position_ids_decode_ctx8k`（取 `[:, :, -1:]`） | 所有 `layer_*_full_attn_block_decode_ctx8k` |
+| `hidden_states`（每层输出） | bf16 [1, 1, 2048] | layer N attn / moe | layer N+1 |
+| 末层 `hidden_states` | bf16 [1, 1, 2048] | 最后一个 moe block | `norm_1` |
+| `output` | bf16 [1, 1, 2048] | `norm_1` | `lm_head_1` |
+| `new_key/new_value` | bf16 [1, 2, 8193, 256] | `layer_*_full_attn_block_decode_ctx8k` | 下一步的 `past_key/past_value` |
+| `new_recurrent_state` | f32 [1, 32, 128, 128] | `layer_*_linear_attn_block` | 下一步的 `recurrent_state` |
 
-完整 forward 由四部分组成：
+注意：
 
-1. **Vision tower**（27 层 ViT）：跑在 prefill 阶段，结果作为 image_embeds 通过 `mm_inject` 注入文本序列；decode 阶段不再跑，相关 ONNX 仅在 prefill 目录导出。
-2. **Text embedding**：单 token `[B, 1]` → `[B, 1, H]`。
-3. **多模态注入**：发生在 prefill 阶段；decode 阶段不会再出现 image-token，因此**不导出** `mm_inject_*.onnx`。
-4. **Text decoder stack（40 层）**：携带 `past_key/past_value`（full attention）或 `conv_state/recurrent_state`（linear attention）的单步递推，与纯文本路径完全一致。
+- `mrope_position_ids_decode_ctx8k` 输出是 **8193 长度**的 3D positions（覆盖 8192 历史 + 1 新 token），但每一步只把**最后一列** `[:, :, -1:]` 传给 full-attn block（其 input shape 是 `[3, 1, 1]`）
+- `attention_mask: bf16[1, 1, 1, 8193]` 给 full-attn block，对应 KV 长 8192 + 当前 1 个新 token
+- `past_key/past_value`：上一步的 KV 缓存（长度 8192）；`new_key/new_value`：拼接后的 KV 缓存（长度 8193）
 
-代表层口径同纯文本目录：
+---
 
-- text 一侧仍是 `layer 0`（linear attention + MoE）+ `layer 3`（full attention + MoE）两条并列样本路径。
+## 4. `unk__N` 状况
 
-## `decode` 在这里具体是什么意思
+decode 阶段所有 9 张图 **0 个 `unk__N`**。原因：
 
-- 文本主链激活张量 `seq_len=1`；历史信息通过 KV-cache / 递推状态保留。
-- 与文本目录唯一的差异是：text 主链里的 `position_ids` 在 vl 推理中是 3D `[3, B, 1]`（M-RoPE 的 `T/H/W` 三轴），由 `Qwen3_5MoeModel.get_rope_index` 在 CPU 端构造、每步自增；现有 `RotaryEmbeddingBlockMoE` 已支持 3D `position_ids`，相关 full-attention 子图导出时同步打开了 `mrope_interleaved`，无需重新导出。
+- 没有 `vision_cu_seqlens` 路径（视觉塔只在 prefill 跑）
+- 没有 `mm_inject` / `masked_scatter` 路径（image embeddings 已在 prefill 写入 KV）
+- 解码层全部静态形状（`seq_len=1` 已知、KV 长度 = `decode_context_len + 1` 也已知）
 
-## 文本主链主图
+---
 
-### `layer 0` 样本路径
+## 5. 运行时如何把这些 ONNX 串起来
 
-`embedding_1 → layer_00_linear_attn_block → layer_00_moe_block_1`
+伪代码（一步 decode）：
 
-### `layer 3` 样本路径
+```python
+import onnxruntime as ort
 
-`layer_03_full_attn_block_decode_ctx8k → layer_03_moe_block_1`
+# 输入：单 token、上一步的 KV / state、累计 attention_mask、rope_deltas
+# Stage 1: embedding + M-RoPE
+hidden = run("embedding_1.onnx",
+             input_ids=new_token_id,            # i64 [1, 1]
+             embedding_weight=W_embed)["hidden_states"]
 
-四张代表层 text 主图的语义、shape、dtype 与 [`Qwen3_5_35B_A3B_ONNX_Decode_8k/README.md`](../ori/Qwen3_5_35B_A3B_ONNX_Decode_8k/README.md) 完全相同（同一份导出代码、同一份 backbone 权重，仅经过 transformers 的 key 透明 remap），不在本目录重复说明。
+position_ids_full = run("mrope_position_ids_decode_ctx8k.onnx",
+                        attention_mask=cumul_attention_mask,    # i64 [1, 8193]
+                        rope_deltas=rope_deltas)["position_ids"]  # i64 [3, 1, 8193]
+position_ids_step = position_ids_full[:, :, -1:]                  # i64 [3, 1, 1]
 
-## 你真正需要关心的多模态差异
+# Stage 2: 文本解码层
+for layer_idx, layer_kind in enumerate(real_layer_layout):
+    if layer_kind == "linear":
+        out = run("layer_00_linear_attn_block.onnx",
+                  **{"hidden_states.1": hidden,
+                     "conv_state": conv_state[layer_idx],
+                     "recurrent_state": recurrent_state[layer_idx],
+                     "padding_mask": padding_mask})
+        conv_state[layer_idx]      = out["new_conv_state"]
+        recurrent_state[layer_idx] = out["new_recurrent_state"]
+        hidden = run("layer_00_moe_block_1.onnx",
+                     **{"hidden_states.1": out["hidden_states"], "experts_gate_up": ..., ...})
+    elif layer_kind == "full":
+        out = run("layer_03_full_attn_block_decode_ctx8k.onnx",
+                  **{"hidden_states.1": hidden,
+                     "position_ids": position_ids_step,
+                     "attention_mask": cumul_attn_mask_4d,
+                     "past_key": kv_cache_k[layer_idx],
+                     "past_value": kv_cache_v[layer_idx]})
+        kv_cache_k[layer_idx] = out["new_key"]
+        kv_cache_v[layer_idx] = out["new_value"]
+        hidden = run("layer_03_moe_block_1.onnx",
+                     **{"hidden_states.1": out["hidden_states"], ...})
 
-- 多模态情况下 `position_ids` 的语义从 1D `[B, 1]` 变为 3D `[3, B, 1]`（M-RoPE 的 `T/H/W` 三轴）。
-- 文本侧的 `layer_03_full_attn_block_decode_ctx8k.onnx` 已对 M-RoPE 做兼容（`mrope_interleaved=true` 来自 config，导出时已生效），不需要重新导出。
-- M-RoPE 的 3D `position_ids` 由 `Qwen3_5MoeModel.get_rope_index` 计算（不进 ONNX），由推理引擎在 CPU 端完成，每步 decode 自增。
-- vision tower / mm_inject 一侧在 decode 阶段不会触发，相关 ONNX 子图全部归档到 prefill 目录，避免与 prefill 重复冗余。
+# Stage 3: 输出
+hidden = run("norm_1.onnx", hidden_states=hidden)["output"]
+logits = run("lm_head_1.onnx",
+             hidden_states=hidden, lm_head_weight=W_lmhead)["logits"]
+# logits: bf16 [1, 1, 248320]
 
-## 目录里的辅助文件
+# 采样得到下一个 token，更新 cumul_attention_mask（拼一个 1）、rope_deltas，循环
+```
 
-- `onnx_stats.json`：每个导出文件的基础统计
-- linear attention 的 `RecurrentGatedDeltaRule` 参考子图与纯文本目录完全一致，按需查阅 [`Qwen3_5_35B_A3B_ONNX_Decode_8k/README.md`](../ori/Qwen3_5_35B_A3B_ONNX_Decode_8k/README.md) "custom op 参考子图" 一节
+---
+
+## 6. 与 prefill 的关系
+
+| 阶段 | 文件 | vl-only | 文本侧 |
+|---|---|---|---|
+| prefill | 9 个 vision/multimodal 文件 + 9 个文本文件 | ✓ | ✓ |
+| decode | **0** 个 vision/multimodal 文件 + 9 个文本文件 | — | ✓ |
+
+decode 不再涉及视觉塔与 `mm_inject`，因为：
+1. 视觉特征在 prefill 跑过一次，结果已经混入 `inputs_embeds_out` 并写入了 KV-cache
+2. M-RoPE 3D `position_ids` 在每一步重算（看 `mrope_position_ids_decode_ctx8k.onnx`）
+
+decode 与 prefill **共享文本权重**——所有 `layer_*` / `embedding_weight` / `lm_head_weight` 是同一份；只是为了支持单 token 推理，文件后缀从 `_8k.onnx` 变为 `_1.onnx` 并且 full-attn 文件名加了 `_decode_ctx8k` 区分前缀和长度。

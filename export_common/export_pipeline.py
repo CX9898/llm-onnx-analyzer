@@ -37,6 +37,44 @@ def _has_bfloat16_initializer_cast(model: onnx.ModelProto) -> bool:
     return False
 
 
+def _restore_static_input_shapes(
+    model: onnx.ModelProto,
+    input_shapes: dict[str, list[int]],
+) -> None:
+    """
+    Re-apply the dummy-input static shapes onto ``model.graph.input`` after
+    ``onnxsim.simplify``. ``onnxsim`` may downgrade input ``value_info``
+    annotations to ``unk__N`` when it folds a defensive Reshape sitting
+    between an input and a downstream consumer, even though the graph's
+    runtime contract still requires the original static shape (matched by
+    every consumer node, e.g. ``ScatterND``).
+
+    Operates only on inputs whose names appear in ``input_shapes`` and
+    whose existing rank already matches the requested rank, so dynamic
+    inputs that legitimately need ``dim_param`` placeholders are not
+    rewritten.
+    """
+    for inp in model.graph.input:
+        if inp.name not in input_shapes:
+            continue
+        target = input_shapes[inp.name]
+        shape_proto = inp.type.tensor_type.shape
+        if len(shape_proto.dim) != len(target):
+            continue
+        # Only restore when at least one dim is currently a placeholder
+        # (don't churn proto bytes when the static shape is already there).
+        needs_restore = any(
+            (not d.HasField("dim_value")) or d.dim_param.startswith("unk")
+            for d in shape_proto.dim
+        )
+        if not needs_restore:
+            continue
+        shape_proto.ClearField("dim")
+        for size in target:
+            new_dim = shape_proto.dim.add()
+            new_dim.dim_value = int(size)
+
+
 def parse_bool_arg(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -180,6 +218,20 @@ def onnx_export(
                     skip_constant_folding=skip_constant_folding,
                 )
                 if ok:
+                    # ``onnxsim.simplify`` occasionally downgrades the
+                    # graph-input ``value_info`` shape annotations when
+                    # it folds a defensive Reshape sitting between an
+                    # input and a downstream consumer (notably ScatterND,
+                    # see ``MMInjectBlock``). The graph topology is
+                    # correct — only the input's *declared* shape gets
+                    # turned into ``unk__N``. Since ``dummy_inputs`` is
+                    # authoritative for the static representative
+                    # scenario (and ``dynamic_axes`` is honoured by the
+                    # tracer separately, well before this pass), we
+                    # restore the static shape annotations here so the
+                    # downstream MAC / memory / shape analysis tools see
+                    # full static IO contracts.
+                    _restore_static_input_shapes(simplified, input_shapes)
                     onnx.save(simplified, save_path)
                     sim_status = "ok_skip_cf" if skip_constant_folding else "ok"
                     if skip_constant_folding:

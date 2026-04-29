@@ -16,7 +16,7 @@ python export_qwen_onnx/export_qwen_onnx_main.py model_path --phase {prefill|dec
 - `--phase`: 必填，`prefill` 或 `decode`
 - `--variant`: `text` 或 `vl`，默认 `text`。
   - `text` ⇒ 加载 `Qwen3_5MoeForCausalLM`，只导出文本侧子图。
-  - `vl` ⇒ 加载 `Qwen3_5MoeForConditionalGeneration`；**`--phase prefill` 时**在文本侧子图基础上**额外**导出 4 个 vision/MM 子图（patch_embed、代表 ViT block、patch_merger、mm_inject），**`--phase decode` 时**只导文本侧子图（图像 token 已在 prefill 阶段写入 KV-cache，decode 不再触发 vision/mm_inject）。
+  - `vl` ⇒ 加载 `Qwen3_5MoeForConditionalGeneration`；**`--phase prefill` 时**在文本侧子图基础上**额外**导出 9 个 vision/multimodal 子图（patch_embed、pos_embed_interp、rot_pos_emb、cu_seqlens、代表 ViT block、patch_merger、image_mask_build、mm_inject、mrope_position_ids_prefill），**`--phase decode` 时**导出文本侧子图 + 1 个 multimodal 子图（mrope_position_ids_decode）——图像 token 在 prefill 阶段已写入 KV-cache，但 M-RoPE 的 3D `position_ids` 在每一步 decode 都要重新构造。
 - `--export_scope`: `representative` 或 `full`，默认 `representative`
 - `--seq_len`: `prefill` 导出长度，默认 `8192`
 - `--decode_context_len`: `decode` 时 full attention 的历史上下文长度，默认 `8192`
@@ -27,6 +27,7 @@ python export_qwen_onnx/export_qwen_onnx_main.py model_path --phase {prefill|dec
 - `--vision_block_layer`: 代表性 ViT block 层 index，仅 `--variant vl` 生效，默认 `0`
 - `--vision_token_seq_len`: vision tower 静态导出 seq_len（即一次推理的 patch token 数），仅 `--variant vl` 生效，默认 `1024`（对应 32×32 grid）
 - `--mm_image_token_count`: mm_inject 导出时假设注入的 image token 数，仅 `--variant vl` 生效，默认 `256`（= `vision_token_seq_len // spatial_merge_size**2`）
+- `--mrope_text_pre_len`: 代表性 prefill 请求中位于唯一 image segment 之前的 text token 数，仅 `--variant vl --phase prefill` 生效，默认 `64`。剩余 text token 自动落到 image 之后的后缀里，使 `text_pre + image_token_count + text_post == seq_len`。
 - `--opset`: ONNX opset，默认 `20`
 - `--no_simplify`: 跳过 `onnxsim` 简化
 - `--output_dir`: 输出目录；不填时按 phase + variant 自动给默认目录
@@ -94,22 +95,31 @@ python export_qwen_onnx/export_qwen_onnx_main.py \
 - `layer_XX_linear_attn_block_ChunkGatedDeltaRule_chunk<chunk>_<seq>.onnx`
 - `layer_XX_linear_attn_block_ChunkGatedDeltaRule_DeltaNetChunkStep_chunk<chunk>.onnx`
 
-`--variant vl --phase prefill` 在以上文本子图基础上额外生成：
+`--variant vl --phase prefill` 在以上文本子图基础上额外生成 vision tower **+ multimodal flow** 共 9 张子图，按数据流顺序：
 
-- `vision_patch_embed_<vseq>.onnx`：Conv3d patchify
-- `vision_block_<idx>_repr_<vseq>.onnx`：单个代表性 ViT block（norm1 → attn → 残差 → norm2 → mlp → 残差），attention 走单 segment 路径（见下方"未导出的 vision 控制流"）
+- `vision_patch_embed_<vseq>.onnx`：Conv3d patchify（对应 `Qwen3_5MoeVisionModel.forward` 行 1239）
+- `vision_pos_embed_interp_<vseq>.onnx`：`hidden_states + fast_pos_embed_interpolate(grid_thw)`，含 **学习参数 `pos_embed.weight: [num_position_embeddings, hidden_size]`**（对应源码行 1241–1242，`fast_pos_embed_interpolate` 行 1163）
+- `vision_rot_pos_emb_<vseq>.onnx`：`rot_pos_emb(grid_thw) → cat → cos/sin`（对应源码行 1244–1250，`rot_pos_emb` 行 1123；含 `Qwen3_5MoeVisionRotaryEmbedding.inv_freq` 内联 buffer）
+- `vision_cu_seqlens_<vseq>.onnx`：`repeat_interleave/cumsum/pad` 构造可变长度打包前缀和（对应源码行 1252–1260）
+- `vision_block_<idx>_repr_<vseq>.onnx`：代表 ViT block；attention **保留 `cu_seqlens` 输入并发出源码侧 `tensor_split → 逐段 SDPA → cat` 的拓扑**（对应源码行 1054–1086 + `Qwen3_5MoeVisionAttention` eager 分支 1026–1047）
 - `vision_patch_merger_<vseq>.onnx`：spatial merge + LayerNorm + 2-Linear MLP（vision hidden → text hidden）
-- `mm_inject_<seq>.onnx`：`inputs_embeds.masked_scatter(image_mask, image_embeds)`，把 vision tower 的输出写回 text 序列里的 image-token 位置
+- `image_mask_build_<seq>.onnx`：`Equal(input_ids, image_token_id) → Unsqueeze → Expand`，构造 image-token 位置布尔掩码（对应 `Qwen3_5MoeModel.get_placeholder_mask` 行 1666–1671）；作为源码对齐参考保留
+- `mm_inject_<seq>.onnx`：源码 `inputs_embeds.masked_scatter(image_mask, image_embeds)`（行 1773）的 ONNX 友好等价——行级 `ScatterND(inputs_embeds, image_position_indices, image_embeds)`。避免 `masked_scatter → NonZero` 引入的 data-dependent `unk__N` shape，全图静态便于 MAC/内存分析。等价依据：源码 `image_mask` 是按 `unsqueeze(-1).expand_as(...)` 的整行 mask，每个 image token 占满整个 `H_text` 行，因此与按行 `ScatterND` 数学一致
+- `mrope_position_ids_prefill_<seq>.onnx`：M-RoPE 的 `[3, B, S]` 位置索引 + `[B, 1]` rope_deltas，按代表场景静态展开 `[text_pre | image | text_post]` 段布局（对应源码行 1707 `if` 分支 + `get_rope_index` 行 1511 + `get_vision_position_ids` 行 1455）
+- 此外 **`vl` 变体下的 `layer_XX_full_attn_block...` 在 prefill / decode 两侧均使用 3D `[3, B, S]` 形状的 dummy `position_ids`** 做 trace，对应锁住 `RotaryEmbeddingBlockMoE.forward` 的 `position_ids.ndim==3` 分支，使 IO 契约直接接收 `mrope_position_ids_*.onnx` 的输出（参数实现：`qwen_merged_block_export.export_full_attn_block(position_ids_ndim=3)`）。纯文本 `base` 变体仍保留 1D `[B, S]` 契约；T=H=W 时两条路径数值完全等价，已通过 unit-level smoke 验证
 
 > 其中 `<vseq>` 取自 `--vision_token_seq_len`（默认 `1024`）；`<seq>` 同 text 路径（prefill 取 `--seq_len`）。
 
-`--variant vl --phase decode` **不会**额外导出上述 4 个 vision/MM 子图——decode 阶段是单 token 自回归（`seq_len=1`），图像 token 在 prefill 阶段就已通过 `mm_inject` 写入 `inputs_embeds` 并落入 KV-cache，后续步骤不会再触发 vision tower 或 `mm_inject`，因此 vl decode 输出目录与纯文本 decode 等价（同一组代表层 text 主图）。
+`--variant vl --phase decode` 在文本侧子图基础上**额外**导出 1 张 multimodal 子图：
 
-未导出的 vision 控制流（无可学习权重，由推理引擎在 CPU 端按 `grid_thw` 计算并以 `cos/sin` 等张量喂入子图）：
+- `mrope_position_ids_decode_ctx<N>.onnx`：每一步 decode 都要重算的 3D `position_ids: [3, B, ctx+1]`（对应 `compute_3d_position_ids` 行 1720 `elif` 分支 + `attention_mask is not None` 子分支）
 
-- `Qwen3_5MoeVisionModel.fast_pos_embed_interpolate(grid_thw)`：基于 48×48 `pos_embed` 表的双线性插值
-- `Qwen3_5MoeVisionModel.rot_pos_emb(grid_thw)`：2D（H, W）旋转位置索引构造
-- `Qwen3_5MoeModel.get_rope_index(...)`：M-RoPE 的 3D `position_ids: [3, B, S]` 构造（含 `itertools.groupby` 与 Python list 操作）
+> Decode 阶段不导 vision tower / `mm_inject`：图像 token 在 prefill 阶段已通过 `mm_inject` 写入 `inputs_embeds` 并落入 KV-cache，单 token 自回归不会再触发它们；但 M-RoPE 的位置索引必须每步重算，因此独占一份 decode 子图。
+
+源码侧仍然不导出的纯 Python 控制流（无可学习权重；表现为 `itertools.groupby` / `.tolist()` / Python list 操作；与代表层导出策略不兼容）：
+
+- `Qwen3_5MoeModel.get_rope_index` 内的 batch loop + `groupby` 段切分：对每一批的多模态 segment layout 而言，**导出选定的代表场景**（单 image，T=1，``[text_pre | image | text_post]``）已经把 segment 静态展开。要分析其他段布局，重导一份。
+- `Qwen3_5MoeModel.compute_3d_position_ids` 的 fallback `else` 分支（`position_ids = None`）：纯调度，下游模型自己重新构造，没有可分析算子。
 
 注意：默认 **不会** 额外导出独立的 `DeltaNetTriangularSolve` 参考子图文件；但主图和 `ChunkGatedDeltaRule` 子图中的 `qwen_onnx::DeltaNetTriangularSolve` 语义仍然保留。
 
@@ -119,8 +129,10 @@ python export_qwen_onnx/export_qwen_onnx_main.py \
 - `qwen_shape_propagation.py`: Qwen 专用静态 shape propagation 规则
 - `qwen_merged_block_export.py`: merged block 导出实现（含 `_load_model(... , variant=...)`）
 - `qwen_onnx_blocks.py`: 文本侧 ONNX wrapper / block 定义
-- `qwen_onnx_blocks_vision.py`: vision tower 与多模态注入的 ONNX wrapper / block 定义
-- `qwen_vision_export.py`: vision/MM 子图 export wrapper
+- `qwen_onnx_blocks_vision.py`: vision tower 内部的 ONNX wrapper / block 定义（patch_embed / pos_embed_interp / rot_pos_emb / cu_seqlens / cu_seqlens-aware ViT block / patch_merger）
+- `qwen_onnx_blocks_mm.py`: 多模态 flow 边界（`Qwen3_5MoeModel.forward` 内位于 `inputs_embeds` 与 language_model 之间的部分）的 ONNX wrapper / block 定义（image_mask_build / mm_inject / M-RoPE position_ids prefill+decode）
+- `qwen_vision_export.py`: vision tower 子图 export wrapper
+- `qwen_mm_export.py`: 多模态 flow 子图 export wrapper
 - `qwen_export_semantics.py`: Qwen 导出语义与 custom op 规则
 
 ## 校验与分析

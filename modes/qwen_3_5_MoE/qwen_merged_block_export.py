@@ -658,7 +658,13 @@ def export_full_attn_block(
     past_seq_len: int = 0,
     fold_pure_shape_chains: bool = False,
     strip_initializers: bool = False,
+    position_ids_ndim: int = 2,
 ) -> None:
+    if position_ids_ndim not in (2, 3):
+        raise ValueError(
+            "position_ids_ndim must be 2 (text-only) or 3 (vl / M-RoPE), "
+            f"got {position_ids_ndim}",
+        )
     cfg = _text_config(model)
     float_dtype = _model_float_dtype(model)
     h = cfg.hidden_size
@@ -669,7 +675,22 @@ def export_full_attn_block(
     causal_mask = torch.zeros((b, 1, s, total_len), dtype=float_dtype)
     for token_idx in range(s):
         causal_mask[:, :, token_idx, p + token_idx + 1 :] = float("-inf")
-    position_ids = torch.arange(p, p + s, dtype=torch.long).unsqueeze(0).expand(b, -1).contiguous()
+    # Dummy ``position_ids`` shape decides which branch of
+    # ``RotaryEmbeddingBlockMoE.forward`` (qwen_onnx_blocks.py line 1626)
+    # the tracer captures in this graph:
+    #     ndim==2 -> static repeat-to-3 path (T=H=W; pure text scenarios).
+    #     ndim==3 -> direct M-RoPE path (T/H/W can differ; multimodal).
+    # The IO contract of the exported graph is locked to whichever shape
+    # the dummy presents (``dynamic_axes={}`` below), so VL variant must
+    # pass ``position_ids_ndim=3`` to interoperate with the
+    # ``mrope_position_ids_*.onnx`` outputs (i64[3, B, S]).
+    position_ids_2d = (
+        torch.arange(p, p + s, dtype=torch.long).unsqueeze(0).expand(b, -1).contiguous()
+    )
+    if position_ids_ndim == 2:
+        position_ids = position_ids_2d
+    else:
+        position_ids = position_ids_2d.unsqueeze(0).expand(3, -1, -1).contiguous()
     if p == 0:
         file_name = f"layer_{layer_idx:02d}_full_attn_block_{_seq_tag(seq_len)}.onnx"
     else:

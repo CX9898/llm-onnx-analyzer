@@ -40,10 +40,18 @@ from qwen_export_shared import (
     export_norm,
 )
 from qwen_vision_export import (
-    export_mm_inject,
     export_vision_block_repr,
+    export_vision_cu_seqlens,
     export_vision_patch_embed,
     export_vision_patch_merger,
+    export_vision_pos_embed_interp,
+    export_vision_rot_pos_emb,
+)
+from qwen_mm_export import (
+    export_image_mask_build,
+    export_mm_inject,
+    export_mrope_position_ids_decode,
+    export_mrope_position_ids_prefill,
 )
 from export_common.onnx_graph_utils import print_simplification_report, reset_records, save_stats_json
 
@@ -126,16 +134,52 @@ def _parse_args() -> argparse.Namespace:
             "(only used when --variant vl). Equals vision_token_seq_len // (spatial_merge_size**2)."
         ),
     )
+    ap.add_argument(
+        "--mrope_text_pre_len",
+        type=int,
+        default=64,
+        help=(
+            "Number of *text* tokens preceding the single image segment in the "
+            "representative prefill request used by mrope_position_ids_prefill_*.onnx "
+            "(only used when --variant vl --phase prefill). The remaining text "
+            "tokens fill the suffix so that "
+            "text_pre + mm_image_token_count + text_post == seq_len."
+        ),
+    )
+    ap.add_argument(
+        "--vision_grid_mode",
+        choices=["dynamic", "static"],
+        default="dynamic",
+        help=(
+            "Trade-off mode for the three H/W-sensitive subgraphs "
+            "(vision_rot_pos_emb / vision_pos_embed_interp / "
+            "mrope_position_ids_prefill).\n"
+            "  dynamic (default) — H/W are real tensor inputs read from "
+            "``grid_thw``; every source op is visible in ONNX, but each "
+            "subgraph carries unk__N for H/W-derived dims.\n"
+            "  static — H/W are captured as Python ints from "
+            "``--vision_token_seq_len`` (and ``--vision_grid_t``); the "
+            "tracer folds the entire arange/cos/sin/repeat chain to "
+            "constants for that grid; 0 unk__N but those source ops "
+            "collapse to a pre-computed lookup table. Re-export per "
+            "resolution if you need multi-bucket coverage."
+        ),
+    )
     return ap.parse_args()
 
 
-def _default_output_dir_for_phase(phase: str, variant: str = "text") -> str:
+def _default_output_dir_for_phase(
+    phase: str,
+    variant: str = "text",
+    grid_mode: str = "dynamic",
+) -> str:
     model_tag = "35B_A3B"
     variant_tag = "_VL" if variant == "vl" else ""
+    grid_tag = "_static" if grid_mode == "static" else ""
     if phase == "prefill":
-        return f"./Qwen3_5_{model_tag}{variant_tag}_Merged_ONNX_Prefill"
+        return f"./Qwen3_5_{model_tag}{variant_tag}_Merged_ONNX_Prefill{grid_tag}"
     if phase == "decode":
-        return f"./Qwen3_5_{model_tag}{variant_tag}_Merged_ONNX_Decode"
+        return f"./Qwen3_5_{model_tag}{variant_tag}_Merged_ONNX_Decode{grid_tag}"
     return "./conservative_merged_moe_onnx"
 
 
@@ -147,7 +191,9 @@ def _apply_phase_preset(args: argparse.Namespace) -> None:
         args.seq_len = 1
 
     if args.output_dir == "./conservative_merged_moe_onnx":
-        args.output_dir = _default_output_dir_for_phase(args.phase, args.variant)
+        args.output_dir = _default_output_dir_for_phase(
+            args.phase, args.variant, args.vision_grid_mode,
+        )
 
 
 def _target_layer_sets(model, export_scope: str, linear_layer: int, full_layer: int) -> tuple[list[int], list[int]]:
@@ -193,15 +239,26 @@ def main() -> None:
     )
     fold_pure_shape_chains = True
     is_vl = args.variant == "vl"
-    # Vision tower + mm_inject are only meaningful during prefill: image
-    # tokens are produced once at prefill time and merged into inputs_embeds
-    # by mm_inject. The decode phase is single-token autoregressive over the
-    # KV cache, with no image-token injection — so the 4 vision-side graphs
-    # are intentionally not re-exported in decode. The decode output dir
-    # therefore contains only the text-side graphs (same set as variant=text).
-    export_vision_pipeline = is_vl and is_prefill_phase
-    # Total step count: text path = 7 steps; prefill-vl adds 4 vision-side steps
-    total_steps = 7 + (4 if export_vision_pipeline else 0)
+    static_grid = args.vision_grid_mode == "static"
+    # Vision tower + multimodal-flow graphs are only meaningful during
+    # prefill: image tokens are produced once at prefill time and merged
+    # into inputs_embeds by mm_inject. The decode phase is single-token
+    # autoregressive over the KV cache, with no image-token injection — so
+    # the vision-side graphs and image_mask / mm_inject are intentionally
+    # not re-exported in decode. The text decoder still needs the M-RoPE
+    # 3D ``position_ids`` constructor on every decode step, however, so
+    # ``mrope_position_ids_decode_ctx<N>.onnx`` *is* exported in vl-decode.
+    export_vision_prefill_pipeline = is_vl and is_prefill_phase
+    export_mrope_decode = is_vl and is_decode_phase
+    # Total step count:
+    #   text path                                        = 7 steps
+    #   vl-prefill adds 9 multimodal/vision-side steps   = +9
+    #   vl-decode adds 1 mrope decode step               = +1
+    total_steps = (
+        7
+        + (9 if export_vision_prefill_pipeline else 0)
+        + (1 if export_mrope_decode else 0)
+    )
     step = [0]
 
     def _bump() -> str:
@@ -212,7 +269,7 @@ def main() -> None:
     print(f"phase preset: {args.phase}")
     print(f"export scope: {args.export_scope}")
 
-    if export_vision_pipeline:
+    if export_vision_prefill_pipeline:
         # ── vision tower (prefill only) ───────────────────────────────
         # Vision tokens are produced once at prefill time, then their merged
         # image_embeds are scatter-injected into inputs_embeds via mm_inject.
@@ -220,6 +277,40 @@ def main() -> None:
         # any of these graphs, so we skip exporting them in decode.
         print(f"{_bump()} vision_patch_embed_{_seq_tag(args.vision_token_seq_len)}")
         export_vision_patch_embed(
+            model,
+            args.output_dir,
+            args.opset,
+            simplify,
+            args.vision_token_seq_len,
+            fold_pure_shape_chains=fold_pure_shape_chains,
+        )
+
+        print(
+            f"{_bump()} vision_pos_embed_interp_{_seq_tag(args.vision_token_seq_len)}"
+        )
+        export_vision_pos_embed_interp(
+            model,
+            args.output_dir,
+            args.opset,
+            simplify,
+            args.vision_token_seq_len,
+            static_grid=static_grid,
+            fold_pure_shape_chains=fold_pure_shape_chains,
+        )
+
+        print(f"{_bump()} vision_rot_pos_emb_{_seq_tag(args.vision_token_seq_len)}")
+        export_vision_rot_pos_emb(
+            model,
+            args.output_dir,
+            args.opset,
+            simplify,
+            args.vision_token_seq_len,
+            static_grid=static_grid,
+            fold_pure_shape_chains=fold_pure_shape_chains,
+        )
+
+        print(f"{_bump()} vision_cu_seqlens_{_seq_tag(args.vision_token_seq_len)}")
+        export_vision_cu_seqlens(
             model,
             args.output_dir,
             args.opset,
@@ -254,9 +345,19 @@ def main() -> None:
             fold_pure_shape_chains=fold_pure_shape_chains,
         )
 
-        print(
-            f"{_bump()} mm_inject_{_seq_tag(token_seq_len)}"
+        # ── multimodal flow (image_mask -> mm_inject -> mrope) ───────
+        print(f"{_bump()} image_mask_build_{_seq_tag(token_seq_len)}")
+        export_image_mask_build(
+            model,
+            args.output_dir,
+            args.batch_size,
+            args.opset,
+            simplify,
+            token_seq_len,
+            fold_pure_shape_chains=fold_pure_shape_chains,
         )
+
+        print(f"{_bump()} mm_inject_{_seq_tag(token_seq_len)}")
         export_mm_inject(
             model,
             args.output_dir,
@@ -265,6 +366,46 @@ def main() -> None:
             simplify,
             token_seq_len,
             image_token_count=args.mm_image_token_count,
+            fold_pure_shape_chains=fold_pure_shape_chains,
+        )
+
+        # Derive the representative image grid (T=1, square H==W) from
+        # the user-facing ``--vision_token_seq_len``. The same convention
+        # is already used by every vision-tower export above.
+        from qwen_vision_export import _representative_grid_thw  # local import to avoid cycle
+        grid_t, grid_h, grid_w = _representative_grid_thw(args.vision_token_seq_len)
+
+        print(f"{_bump()} mrope_position_ids_prefill_{_seq_tag(token_seq_len)}")
+        export_mrope_position_ids_prefill(
+            model,
+            args.output_dir,
+            args.batch_size,
+            args.opset,
+            simplify,
+            token_seq_len,
+            text_pre_len=args.mrope_text_pre_len,
+            image_token_count=args.mm_image_token_count,
+            image_grid_t=grid_t,
+            image_grid_h=grid_h,
+            image_grid_w=grid_w,
+            static_grid=static_grid,
+            fold_pure_shape_chains=fold_pure_shape_chains,
+        )
+
+    if export_mrope_decode:
+        # vl-decode still needs the 3D ``position_ids`` builder on every
+        # step (compute_3d_position_ids elif branch). No vision tower or
+        # mm_inject in decode, just the M-RoPE index recompute.
+        print(
+            f"{_bump()} mrope_position_ids_decode_ctx{_seq_tag(args.decode_context_len)}"
+        )
+        export_mrope_position_ids_decode(
+            model,
+            args.output_dir,
+            args.batch_size,
+            args.opset,
+            simplify,
+            decode_context_len=args.decode_context_len,
             fold_pure_shape_chains=fold_pure_shape_chains,
         )
 
@@ -321,6 +462,13 @@ def main() -> None:
             fold_pure_shape_chains=fold_pure_shape_chains,
         )
 
+    # In the ``vl`` (multimodal) variant the upstream
+    # ``mrope_position_ids_*.onnx`` graphs emit 3D ``position_ids[3, B, S]``
+    # (true M-RoPE T/H/W axes). Trace the matching 3D branch of
+    # ``RotaryEmbeddingBlockMoE.forward`` so the IO contract of
+    # ``layer_*_full_attn_block_*.onnx`` accepts that shape directly.
+    # Pure-text variant keeps the 2D contract (T=H=W static repeat).
+    full_attn_position_ids_ndim = 3 if args.variant == "vl" else 2
     print(f"{_bump()} full attention blocks ({len(full_layers)})")
     for layer_idx in full_layers:
         if is_decode_phase:
@@ -335,6 +483,7 @@ def main() -> None:
                 1,
                 past_seq_len=args.decode_context_len,
                 fold_pure_shape_chains=fold_pure_shape_chains,
+                position_ids_ndim=full_attn_position_ids_ndim,
             )
         else:
             print(f"  layer_{layer_idx:02d}_full_attn_block_{seq_tag}")
@@ -347,6 +496,7 @@ def main() -> None:
                 simplify,
                 args.seq_len,
                 fold_pure_shape_chains=fold_pure_shape_chains,
+                position_ids_ndim=full_attn_position_ids_ndim,
             )
 
     print(f"{_bump()} exported moe blocks reused above")

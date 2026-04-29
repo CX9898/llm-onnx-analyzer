@@ -1,175 +1,254 @@
-# Qwen3.5-MoE-VL Merged ONNX 说明：`prefill`
+# Qwen3.5-35B-A3B VL — Prefill 8K ONNX 图清单（dynamic 模式）
 
-这个目录保存的是 `Qwen3.5-35B-A3B`（多模态完整版）一套面向 `8k prefill` 的代表层 merged ONNX 子图，以及配套的 vision tower / 多模态注入子图与统计文件。
+本目录是 `Qwen3.5-35B-A3B-VL` **prefill 阶段**的代表性 ONNX 导出，用 `--vision_grid_mode dynamic`（默认）生成。
+源码对应：`transformers/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`。
 
-## 完整数据流（按这个顺序看 onnx）
+- 上下文长度：`seq_len = 8192`（文本侧）
+- 视觉 token：`vision_token_seq_len = 1024`（32×32 grid，单图代表性场景）
+- 注入 image token：`mm_image_token_count = 256`（= `1024 / spatial_merge_size² = 1024 / 4`）
+- 文本前缀长度：`mrope_text_pre_len = 4096`
+- 文件总数：**18**；总 `unk__N`：**145**
+- 设计选择：**dynamic 模式**——3 个对 H/W 敏感的子图（`vision_rot_pos_emb` / `vision_pos_embed_interp` / `mrope_position_ids_prefill`）让 H/W 通过 `grid_thw` 张量真输入，源码每个算子（`Range / Mul / Cos / Sin / Tile / OneHot / Max / ...`）都在 ONNX 图里可见，代价是 145 个 `unk__N`。同一份 ONNX 可以喂不同分辨率（动态形状），quant/编译工具加载时 hint 一下 `grid_thw=[[T,H,W]]` 即可解析所有 unk。
 
-下图覆盖本目录所有主链 onnx 文件，箭头方向就是 forward 时数据流的方向；列在右侧的 `*.onnx` 就是每一步对应的产物文件名。
+> **如果你需要每个分辨率一份完全静态的 ONNX**（0 unk），用 `--vision_grid_mode static` 重导一遍——会输出到 `Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k_static/`。详见末尾 §7 "两种模式的差异"。
 
-```text
-[Vision tower — 每张图/视频片段一次性计算]
+---
 
-  pixel_values_flat:[N,1536]bf16       (N = patch token 数；默认 N=1024 = 32×32 grid)
-        │
-        ▼  vision_patch_embed_1k.onnx
-  patch_embeds:[N,1152]bf16
-        │  (host CPU 加 fast_pos_embed_interpolate, 不进 ONNX 图)
-        ▼  vision_block_00_repr_1k.onnx        ×27 (block-0 作为 27 层 ViT 的代表层)
-  vision_features:[N,1152]bf16
-        │
-        ▼  vision_patch_merger_1k.onnx
-  image_embeds:[N/4, 2048]bf16  ──────────────────────────────┐
-                                                               │
-[Text 主链 — 整段 8k 一次性灌入]                               │
-                                                               │
-  input_ids:[1,8192]i64                                        │
-        │                                                      │
-        ▼  embedding_8k.onnx                                   │
-  inputs_embeds:[1,8192,2048]bf16                              │
-        │                                                      ▼
-        ▼  mm_inject_8k.onnx ◄── image_mask:[1,8192,2048]bool (host CPU 由 input_ids==image_token_id 构造)
-  hidden_states:[1,8192,2048]bf16
-        │
-        │   ×40 层 decoder stack (layer_idx % 4 == 3 → full attention, 否则 linear attention)
-        │   本目录只导出两类代表层:
-        │
-        │     layer 0 (linear attn + MoE):
-        │       ─► layer_00_linear_attn_block_8k.onnx
-        │       ─► layer_00_moe_block_8k.onnx
-        │
-        │     layer 3 (full attn + MoE):
-        │       ─► layer_03_full_attn_block_8k.onnx
-        │       ─► layer_03_moe_block_8k.onnx
-        │
-        ▼  norm_8k.onnx
-  hidden_states:[1,8192,2048]bf16
-        │
-        ▼  lm_head_8k.onnx
-  logits:[1,8192,248320]bf16
+## 1. 阅读顺序（按源码 `forward` pass 自上而下）
+
+整体数据流分 **4 个 stage**——视觉塔、多模态簿记、解码层、输出头。每个 stage 内部再按算子先后展开。
+
+```
+┌─────────────────────────── Stage 1 ───────────────────────────┐
+│   pixel_values (image) ──→ image_embeds [256, 2048]           │
+│                                                                │
+│   vision_patch_embed_1k    ──┐                                 │
+│                              ├─→ vision_pos_embed_interp_1k    │
+│   vision_rot_pos_emb_1k    ──┤      (cos, sin, hidden 流入下方) │
+│   vision_cu_seqlens_1k     ──┘                                 │
+│                                                                │
+│             ↓  hidden_states [1024, 1152] bf16                 │
+│   vision_block_00_repr_1k                                      │
+│   (代表性 ViT block；真实模型有 27 层，逐层串联)                  │
+│             ↓                                                  │
+│   vision_patch_merger_1k                                       │
+│             ↓                                                  │
+│        image_embeds [256, 2048] bf16   ──────────────┐          │
+└────────────────────────────────────────────────────────┼──────┘
+                                                         │
+┌─────────────────────────── Stage 2 ───────────────────┼──────┐
+│   input_ids ──→ embedding_8k ──→ inputs_embeds        │       │
+│   input_ids ──→ image_mask_build_8k ──→ image_mask    │       │
+│                                          ↓            │       │
+│   inputs_embeds ─────┐                                │       │
+│   image_mask  ───────┼──→ mm_inject_8k  ←─────────────┘       │
+│   image_embeds ──────┘         ↓                              │
+│                          inputs_embeds_out [1, 8192, 2048]    │
+│                                ↓                              │
+│   input_ids, mm_token_type_ids, image_grid_thw                │
+│                ──→ mrope_position_ids_prefill_8k              │
+│                       → position_ids [3, 1, 8192] (M-RoPE 3D) │
+│                       → mrope_position_deltas [1, 1]          │
+└───────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────── Stage 3 ───────────────────────────┐
+│   layer_00_linear_attn_block_8k        ←─ 代表 linear-attn 层  │
+│      └─ 内部子图：                                             │
+│         layer_00_linear_attn_block_ChunkGatedDeltaRule_chunk64_8k│
+│             └─ 内部子图：                                       │
+│                layer_00_linear_attn_block_ChunkGatedDeltaRule_  │
+│                DeltaNetChunkStep_chunk64                        │
+│   layer_00_moe_block_8k                ←─ 配对 MoE 块           │
+│   ... ... 真实模型 47 层 linear + 1 层 full（layer 3）...        │
+│   layer_03_full_attn_block_8k          ←─ 代表 full-attn 层     │
+│   layer_03_moe_block_8k                ←─ 配对 MoE 块           │
+└───────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────── Stage 4 ───────────────────────────┐
+│   norm_8k    →  lm_head_8k  →  logits [1, 8192, 248320]        │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-主链之外，本目录还导出两张 **custom op 展开参考子图**（不是独立调用步骤，只是 `layer_00_linear_attn_block_8k.onnx` 顶层图里 `qwen_onnx::ChunkGatedDeltaRule` / `DeltaNetChunkStep` 的内部展开，方便结构对照）：
+---
 
-- `layer_00_linear_attn_block_ChunkGatedDeltaRule_chunk64_8k.onnx`
-- `layer_00_linear_attn_block_ChunkGatedDeltaRule_DeltaNetChunkStep_chunk64.onnx`
+## 2. 完整文件清单（按读法顺序）
 
-> 注：这两类代表层是 **并列样本**，不是 `layer_00_*` 跑完接到 `layer_03_*` 的顺序链路。真实的 40 层 decoder 是 `layer_idx=0,1,2(linear) → 3(full) → 4,5,6(linear) → 7(full) → ...` 这样不断重复，本目录只各取一种代表层导出。
+| # | 文件 | 算子分组 | 输入 | 输出 | 节点 | unk |
+|---|---|---|---|---|---|---|
+| **Stage 1：视觉塔（line 1191-1272）** ||||||||
+| 1 | `vision_patch_embed_1k.onnx` | `Qwen3_5MoeVisionPatchEmbed.forward` | `pixel_values_flat: bf16[1024, 1536]` | `patch_embeds: bf16[1024, 1152]` | 3 | 0 |
+| 2 | `vision_pos_embed_interp_1k.onnx` | `fast_pos_embed_interpolate`（line 1163-1224）+ residual add（line 1242）| `hidden_states_pre: bf16[1024, 1152]`、`grid_thw: i64[1, 3]` | `hidden_states_post: bf16[1024, 1152]` | **84** | **82** ★ |
+| 3 | `vision_rot_pos_emb_1k.onnx` | `rot_pos_emb`（line 1123-1161）+ `cos/sin`（line 1244-1250）| `grid_thw: i64[1, 3]` | `cos: bf16[*, 72]`、`sin: bf16[*, 72]` | **36** | **35** ★ |
+| 4 | `vision_cu_seqlens_1k.onnx` | line 1252-1260 源码原版 `repeat_interleave + cumsum + pad` | `grid_thw: i64[1, 3]` | `cu_seqlens: i64[Padcu_seqlens_dim_0]` | 12 | 4 |
+| 5 | `vision_block_00_repr_1k.onnx` | 代表性 ViT block（27 层中第 0 层；line 1262-1268） | `hidden_states: bf16[1024, 1152]`、`cos/sin: bf16[1024, 72]`、`cu_seqlens: i64[2]` | `hidden_states_out: bf16[1024, 1152]` | 60 | 0 |
+| 6 | `vision_patch_merger_1k.onnx` | `Qwen3_5MoeVisionPatchMerger.forward` | `vision_features: bf16[1024, 1152]` | `image_embeds: bf16[256, 2048]` | 5 | 0 |
+| **Stage 2：多模态簿记（line 1758-1815）** ||||||||
+| 7 | `embedding_8k.onnx` | `get_input_embeddings()(input_ids)`（line 1762） | `input_ids: i64[1, 8192]`、`embedding_weight: bf16[248320, 2048]` | `hidden_states: bf16[1, 8192, 2048]` | 1 | 0 |
+| 8 | `image_mask_build_8k.onnx` | `get_placeholder_mask` 图像分支（line 1666-1671） | `input_ids: i64[1, 8192]`、`image_token_id: i64[]` | `image_mask: bool[1, 8192, 2048]` | 3 | 0 |
+| 9 | `mm_inject_8k.onnx` | line 1773 源码原版 `inputs_embeds.masked_scatter` | `inputs_embeds: bf16[1, 8192, 2048]`、`image_mask: bool[1, 8192, 2048]`、`image_embeds: bf16[256, 2048]` | `inputs_embeds_out: bf16[1, 8192, 2048]` | 8 | 3 |
+| 10 | `mrope_position_ids_prefill_8k.onnx` | `compute_3d_position_ids` if 分支 + `get_rope_index`（line 1511-1707） | `input_ids: i64[1, 8192]`、`mm_token_type_ids: i32[1, 8192]`、`image_grid_thw: i64[1, 3]` | `position_ids: i64[3, 1, *]`、`mrope_position_deltas: i64[1, 1]` | **47** | **21** ★ |
+| **Stage 3：解码层（代表性，line 1336-1430 等）** ||||||||
+| 11 | `layer_00_linear_attn_block_8k.onnx` | linear-attn 层包装（含 q/k/v/g/beta + chunk 主体 + 输出投影） | `hidden_states.3: bf16[1, 8192, 2048]`、`conv_state`、`recurrent_state`、`padding_mask` | `hidden_states: bf16[1, 8192, 2048]`、`new_conv_state`、`new_recurrent_state` | 93 | 0 |
+| 12 | `layer_00_linear_attn_block_ChunkGatedDeltaRule_chunk64_8k.onnx` | linear-attn 主体（chunk=64） | q/k/v/g/beta + recurrent_state | `core_out`、`new_recurrent_state` | 1223 | 0 |
+| 13 | `layer_00_linear_attn_block_ChunkGatedDeltaRule_DeltaNetChunkStep_chunk64.onnx` | 单步 chunk 子图（chunk=64） | 9 个张量（含 upper_mask 等） | `core_out`、`new_recurrent_state` | 23 | 0 |
+| 14 | `layer_00_moe_block_8k.onnx` | layer 0（linear-attn）配对的 MoE | hidden + experts + shared | `hidden_states: bf16[1, 8192, 2048]` | 50 | 0 |
+| 15 | `layer_03_full_attn_block_8k.onnx` | full-attn 层（M-RoPE 3D） | `hidden_states.1`、**`position_ids: i64[3, 1, 8192]`**、`attention_mask`、`past_key/past_value` | `hidden_states`、`new_key`、`new_value` | 136 | 0 |
+| 16 | `layer_03_moe_block_8k.onnx` | layer 3（full-attn）配对的 MoE | 同 #14 | `hidden_states` | 50 | 0 |
+| **Stage 4：输出头** ||||||||
+| 17 | `norm_8k.onnx` | `Qwen3_5MoeRMSNorm` | `hidden_states: bf16[1, 8192, 2048]` | `output: bf16[1, 8192, 2048]` | 11 | 0 |
+| 18 | `lm_head_8k.onnx` | `lm_head` 线性投影 | `hidden_states`、`lm_head_weight: bf16[248320, 2048]` | `logits: bf16[1, 8192, 248320]` | 2 | 0 |
 
-## 先看结论
+---
 
-- `prefill` 的意思是：一次输入整段上下文（含图像/视频 token），文本侧固定 `seq_len=8192`，vision 侧 `vseq=1024`（默认 1024 个 patch token）。
-- 本目录最值得关注的图分两块：
-  - **vision / 多模态接入**（这一目录与纯文本目录的差异点）：
-    - `vision_patch_embed_1k.onnx`
-    - `vision_block_00_repr_1k.onnx`
-    - `vision_patch_merger_1k.onnx`
-    - `mm_inject_8k.onnx`
-  - **文本主链**（与 `Qwen3_5_35B_A3B_ONNX_Prefill_8k` 完全等价的代表层四张主图）：
-    - `layer_00_linear_attn_block_8k.onnx`
-    - `layer_00_moe_block_8k.onnx`
-    - `layer_03_full_attn_block_8k.onnx`
-    - `layer_03_moe_block_8k.onnx`
-- 顶层加载类是 `Qwen3_5MoeForConditionalGeneration`；text 侧子图通过 `model.model.language_model` 取 backbone，与纯文本路径 `Qwen3_5MoeForCausalLM.model` 同构，只是路径被多包了一层。
-- `embedding_8k.onnx`、`norm_8k.onnx`、`lm_head_8k.onnx` 主要补齐完整首尾链路，不是这个目录最核心的差异点。
-- prefill linear attention 的 `ChunkGatedDeltaRule` / `DeltaNetChunkStep` 参考子图与纯文本目录完全一致，本目录不重复说明。
-- **vision tower 与 `mm_inject` 仅在本目录（prefill）导出**：图像 token 在 prefill 阶段一次性写进 `inputs_embeds` 并经 KV-cache 落到缓存里，decode 阶段不会再触发任何 vision/mm 图，因此 [`Qwen3_5_35B_A3B_VL_ONNX_Decode_8k/`](../Qwen3_5_35B_A3B_VL_ONNX_Decode_8k/README.md) 只保留代表层 text 主链 4 张图。
+## 3. 数据流连接边（生产者 → 消费者）
 
-## 目录在整模型里代表什么
+只列**跨文件**的张量；权重 / KV / 状态等仅在单文件内部出现的不计。
 
-Qwen3.5-MoE 多模态完整版的 forward 由四部分组成：
+| 张量 | dtype × shape | 生产者 | 消费者 |
+|---|---|---|---|
+| `patch_embeds` | bf16 [1024, 1152] | `vision_patch_embed_1k` | `vision_pos_embed_interp_1k` |
+| `hidden_states_post` | bf16 [1024, 1152] | `vision_pos_embed_interp_1k` | `vision_block_00_repr_1k` |
+| `cos`, `sin` | bf16 [1024, 72] | `vision_rot_pos_emb_1k` | `vision_block_00_repr_1k` |
+| `cu_seqlens` | i64 *动态长度* | `vision_cu_seqlens_1k` | `vision_block_00_repr_1k`（代表场景下传入 [2]） |
+| `hidden_states_out` | bf16 [1024, 1152] | `vision_block_00_repr_1k` | `vision_patch_merger_1k`（实际跑时所有 27 层串联后才给 merger） |
+| `image_embeds` | bf16 [256, 2048] | `vision_patch_merger_1k` | `mm_inject_8k` |
+| `hidden_states` | bf16 [1, 8192, 2048] | `embedding_8k` | `mm_inject_8k`（作为 `inputs_embeds`） |
+| `image_mask` | **bool [1, 8192, 2048]** | `image_mask_build_8k` | `mm_inject_8k` |
+| `inputs_embeds_out` | bf16 [1, 8192, 2048] | `mm_inject_8k` | 第一个 layer block（`hidden_states.1` / `hidden_states.3`） |
+| `position_ids` | **i64 [3, 1, 8192]**（M-RoPE 3D） | `mrope_position_ids_prefill_8k` | 所有 `layer_*_full_attn_block_8k`（vl 变体 3D 接口） |
+| `hidden_states`（每层输出） | bf16 [1, 8192, 2048] | layer N attn / moe | layer N+1 |
+| 末层 `hidden_states` | bf16 [1, 8192, 2048] | 最后一个 moe block | `norm_8k` |
+| `output` | bf16 [1, 8192, 2048] | `norm_8k` | `lm_head_8k` |
 
-1. **Vision tower**（27 层 ViT）：
-   `pixel_values → patch_embed (Conv3d) → 27 × vision_block → patch_merger → image_embeds`
-   produced once per multimodal request；和文本侧 KV-cache 没有任何耦合。
-2. **Text embedding**：
-   `input_ids → embedding → inputs_embeds`
-3. **多模态注入**：
-   `inputs_embeds.masked_scatter(image_mask, image_embeds)` 把 vision tower 的输出写回 text 序列里 `image_token_id` 对应的位置。
-4. **Text decoder stack（40 层）**：与纯文本路径完全一致。
+---
 
-本目录沿用代表层导出口径：
+## 4. 145 个 `unk__N` 的来源（按文件分类）
 
-- ViT 一侧只导**第 0 层**作为 27 层 Transformer 块的代表样本（`--vision_block_layer 0`，可改）；
-- text 一侧仍是 `layer 0`（linear attention + MoE）+ `layer 3`（full attention + MoE）两条并列样本路径。
+★ 标记的 3 个文件采用 **option B（H/W 真张量输入 + 算子全可见）**：用更多 `unk__N` 换在 ONNX 图里把源码每个张量算子都呈现出来；其余文件保持静态形状。
 
-## `prefill` 在这里具体是什么意思
+### 4.1 ★ Option B 类（3 个文件，138 个 unk）
 
-- 文本主链激活张量 `seq_len=8192`，整段上下文一次性灌入；
-- vision tower 的 patch token 数（vseq）是另一条独立维度，默认 `vseq=1024`（对应一张 32×32 grid 的图）；
-- 两条数据流通过 `mm_inject` 汇合到 text 主链上。
+| 文件 | unk | 节点 | 源码算子覆盖 |
+|---|---|---|---|
+| `vision_pos_embed_interp_1k.onnx` | 82 | 84 | `Range×2`（line 1175-1176 `linspace`，等价展开为 `step = (ngs-1)/(n-1); out = arange(n)*step`）、`Mul×11`、`Add×10`、`Sub×6`、`Clip×2`（line 1182-1183）、`Reciprocal×2`、`Div×2`、`Gather×8`（4 个角的 `pos_embed` 查表）、`Reshape×10` |
+| `vision_rot_pos_emb_1k.onnx` | 35 | 36 | `Range×3`（line 1138-1141 的 3 个 `arange`）、`Einsum`（line 1128 `outer(seq, inv_freq)`）、`Max`（line 1127 `max(h, w)`）、`Cos / Sin`（line 1250）、`Gather×4`、`Mul×2`、`Add×4`、`Expand×2`、`Reshape×2`、`Concat×2` |
+| `mrope_position_ids_prefill_8k.onnx` | 21 | 47 | `Range×3`（pre / image / post 3 段 `arange`）、`Tile×2`（line 1493 `repeat`）、`OneHot×1`（line 1494 `repeat_interleave` 的下放）、`ConstantOfShape×1`（line 1500 `torch.full`）、`Max`（line 1594 `max(grid_h, grid_w)`）、`ReduceMax`（line 1600 `.max() + 1`）、`Sub×2`、`Mul×2`、`ReduceSum×2`、`Stack/Concat`、`Expand×2` |
 
-## vision / 多模态接入主图
+### 4.2 源码本征 unk（2 个文件，7 个 unk）
 
-### `vision_patch_embed_1k.onnx`
+| 文件 | unk | 算子 | 数据依赖原因 |
+|---|---|---|---|
+| `vision_cu_seqlens_1k.onnx` | 4 | `Tile`（`repeat_interleave` 下放）+ `CumSum`/`Pad`/`Reshape` | `repeat_interleave(values, repeats=grid_thw[:,0])` 输出长度 = `repeats.sum()` |
+| `mm_inject_8k.onnx` | 3 | `NonZero`（`masked_scatter` 下放）+ `Transpose`/`Slice`/`Gather` | `NonZero(image_mask)` 输出尺寸 = mask 中 True 的个数 |
 
-- 作用：Conv3d 把已 unfold 的 patch tensor 投到 vision hidden
-- 输入：`pixel_values_flat:bf16:[1024, 3*2*16*16]`（即 `[N_patches, in_channels * temporal_patch_size * patch_size * patch_size]`）
-- 输出：`patch_embeds:bf16:[1024, 1152]`
-- 说明：
-  - 严格对齐 `Qwen3_5MoeVisionPatchEmbed.forward` —— `view → Conv3d → view(-1, hidden)`
-  - `temporal_patch_size=2`，单图复制为长度 2 的时间轴；视频天然带时间维
-  - `pos_embed` 双线性插值（`fast_pos_embed_interpolate`）由推理引擎计算后**加到** patch_embeds 上，**不**进 ONNX 图（Python 控制流，无可学习参数）
+### 4.3 unk 实际运行时形状
 
-### `vision_block_00_repr_1k.onnx`
+**所有 145 个 `unk__N` 在运行时都会解析为静态值**（前提是 `grid_thw` 给定）：
 
-- 作用：单个 ViT block 的代表样本 `norm1 → attn → +residual → norm2 → mlp → +residual`
-- 输入：
-  - `hidden_states:bf16:[1024, 1152]`
-  - `cos:bf16:[1024, 72]`（head_dim = 1152 / 16 = 72）
-  - `sin:bf16:[1024, 72]`
-- 输出：`hidden_states_out:bf16:[1024, 1152]`
-- 说明：
-  - 对齐 `Qwen3_5MoeVisionBlock.forward`，但 attention 走**单 segment 路径**（`cu_seqlens` 简化为 `[0, vseq]`）
-  - 单 segment 路径与上游 `eager_attention_forward` 在 `cu_seqlens.size(0)==2` 时数学等价；切换到 packed 多图/多视频场景时，外部以多次调用本图（每次喂一段）即可
-  - rotary 由 `apply_rotary_pos_emb_vision` 直接调用 transformers 源码符号，避免漂移
-  - softmax 在 fp32 计算后回落到主 dtype，与文本侧一致
+- `vision_rot_pos_emb` 输出：`[4*u1*u2, 72]` = `4 * (H/merge) * (W/merge) * 72` = `[1024, 72]`（当 grid=`[1,32,32]`）
+- `vision_pos_embed_interp` 输出：仍是 `[1024, 1152]`（hidden_states_pre 锁住 shape）
+- `mrope_position_ids_prefill` 输出：`[3, 1, L1+image_seq+L2]` = `[3, 1, 8192]`
 
-### `vision_patch_merger_1k.onnx`
+下游 quant/编译工具加载时 hint `grid_thw = [[1,32,32]]` 即可静态化。
 
-- 作用：spatial merge + LayerNorm + 2-Linear MLP，把 vision hidden（1152）映射到 text hidden（2048）
-- 输入：`vision_features:bf16:[1024, 1152]`
-- 输出：`image_embeds:bf16:[256, 2048]`
-  - `256 = 1024 / spatial_merge_size**2 = 1024 / 4`
-- 说明：
-  - 对齐 `Qwen3_5MoeVisionPatchMerger.forward`
-  - 先 `view(-1, hidden_size * spatial_merge**2)`（spatial concat），再 LayerNorm + Linear（`4*1152→4*1152`）+ `GELU` + Linear（`4*1152→2048`）
-  - `use_postshuffle_norm=False`（与默认配置一致）
+---
 
-### `mm_inject_8k.onnx`
+## 5. 运行时如何把这些 ONNX 串起来
 
-- 作用：把 `image_embeds` 写回 `inputs_embeds` 中 image-token 占位
-- 输入：
-  - `inputs_embeds:bf16:[1, 8192, 2048]`
-  - `image_mask:bool:[1, 8192, 2048]`（按 hidden 维 broadcast 后的布尔张量；`True` 表示该位置是 image token 占位）
-  - `image_embeds:bf16:[256, 2048]`
-- 输出：`inputs_embeds_out:bf16:[1, 8192, 2048]`
-- 说明：
-  - 严格对应源码 `inputs_embeds.masked_scatter(image_mask, image_embeds)`
-  - `image_mask` 由外部按 `input_ids == image_token_id` 构造（保留同样的 `unsqueeze(-1).expand_as` 语义）；ONNX 图本身不绑定 `image_token_id`，便于复用到不同 vocab 配置
-  - 静态导出时假设 `mask.sum() == image_embeds.shape[0] * H_text`；运行时 image token 数可变化
+伪代码（单图、单 batch、prefill 一次）：
 
-## 文本主链主图
+```python
+import onnxruntime as ort
 
-### `layer 0` 样本路径
+# Stage 1: vision tower
+patch_embeds = run("vision_patch_embed_1k.onnx",
+                   pixel_values_flat=pixel_values.reshape(1024, 1536))
+hidden_post = run("vision_pos_embed_interp_1k.onnx",
+                  hidden_states_pre=patch_embeds,
+                  grid_thw=image_grid_thw)
 
-`embedding_8k → mm_inject_8k → layer_00_linear_attn_block_8k → layer_00_moe_block_8k`
+cos, sin   = run("vision_rot_pos_emb_1k.onnx", grid_thw=image_grid_thw)
+cu_seqlens = run("vision_cu_seqlens_1k.onnx",   grid_thw=image_grid_thw)
 
-### `layer 3` 样本路径
+vision_hidden = hidden_post
+for layer_idx in range(27):
+    vision_hidden = run("vision_block_00_repr_1k.onnx",
+                        hidden_states=vision_hidden,
+                        cos=cos, sin=sin, cu_seqlens=cu_seqlens)
 
-`layer_03_full_attn_block_8k → layer_03_moe_block_8k`
+image_embeds = run("vision_patch_merger_1k.onnx",
+                   vision_features=vision_hidden)  # [256, 2048]
 
-> `mm_inject` 在数据流上紧跟 embedding，把 image token 占位换成真正的 visual feature，**之后整段 text decoder 的输入** `hidden_states:[1, 8192, 2048]` **与纯文本路径完全一致**。这是当前文本侧子图无需任何改动就能直接接入多模态的关键。
+# Stage 2: 多模态簿记
+inputs_embeds = run("embedding_8k.onnx",
+                    input_ids=input_ids, embedding_weight=W_embed)
+image_mask    = run("image_mask_build_8k.onnx",
+                    input_ids=input_ids, image_token_id=image_token_id)
+inputs_embeds = run("mm_inject_8k.onnx",
+                    inputs_embeds=inputs_embeds,
+                    image_mask=image_mask,
+                    image_embeds=image_embeds)
+position_ids, rope_deltas = run("mrope_position_ids_prefill_8k.onnx",
+                                input_ids=input_ids,
+                                mm_token_type_ids=mm_token_type_ids,
+                                image_grid_thw=image_grid_thw)
 
-四张代表层 text 主图的语义、shape、dtype 与 [`Qwen3_5_35B_A3B_ONNX_Prefill_8k/README.md`](../ori/Qwen3_5_35B_A3B_ONNX_Prefill_8k/README.md) 完全相同（同一份导出代码、同一份 backbone 权重，仅经过 transformers 的 key 透明 remap），不在本目录重复说明。
+# Stage 3: 文本解码层
+hidden = inputs_embeds
+for layer_idx, layer_kind in enumerate(real_layer_layout):
+    if layer_kind == "linear":
+        out = run("layer_00_linear_attn_block_8k.onnx", ...)
+        hidden = run("layer_00_moe_block_8k.onnx", ...)
+    elif layer_kind == "full":
+        out = run("layer_03_full_attn_block_8k.onnx",
+                  position_ids=position_ids, ...)
+        hidden = run("layer_03_moe_block_8k.onnx", ...)
 
-## 你真正需要关心的多模态差异
+# Stage 4: 输出
+hidden = run("norm_8k.onnx", hidden_states=hidden)["output"]
+logits = run("lm_head_8k.onnx",
+             hidden_states=hidden, lm_head_weight=W_lmhead)["logits"]
+```
 
-- 多模态情况下 `position_ids` 的语义从 1D `[B, S]` 变为 3D `[3, B, S]`（M-RoPE 的 `T/H/W` 三轴），`Qwen3_5MoeTextRotaryEmbedding`（已封装为 `RotaryEmbeddingBlockMoE`）会按 `mrope_section=[11,11,10]` 做 interleave。
-- 文本侧的 `layer_03_full_attn_block_8k.onnx` **本身已对 M-RoPE 做兼容**（`mrope_interleaved=true` 来自 config，导出时已生效）；纯文本场景下外部喂 1D `position_ids`（被 `RotaryEmbeddingBlockMoE` 内部静态展开为三路相同），多模态场景下喂真实 3D `position_ids`，**不需要重新导出**。
-- M-RoPE 的 3D `position_ids` 由 `Qwen3_5MoeModel.get_rope_index` 计算（含 `itertools.groupby` 与 Python list 操作，不进 ONNX 图），由推理引擎在 CPU 端完成。
-- vision tower 一侧的 `cos/sin`（2D 旋转）由 `rot_pos_emb(grid_thw)` + `fast_pos_embed_interpolate(grid_thw)` 在 CPU 端计算并喂入子图，同样不进 ONNX。
+---
 
-## 目录里的辅助文件
+## 6. 已知导出注释
 
-- `onnx_stats.json`：每个导出文件的基础统计
-- linear attention 的 `ChunkGatedDeltaRule` / `DeltaNetChunkStep` 参考子图与纯文本目录完全一致，按需查阅 [`Qwen3_5_35B_A3B_ONNX_Prefill_8k/README.md`](../ori/Qwen3_5_35B_A3B_ONNX_Prefill_8k/README.md) "custom op 参考子图" 一节
+- `layer_00_linear_attn_block_8k.onnx` 与 `..._ChunkGatedDeltaRule_chunk64_8k.onnx`：`onnxsim` 在大节点数（>1k）上偶发死循环，跳过简化（`onnxsim=not_run`），shape inference 正常。
+- `vision_rot_pos_emb_1k.onnx` 输出 `cos / sin` 第一维为符号 `4*u1*u2`（即 `(H/merge) * (W/merge) * merge² = H*W`，运行时 = 1024）；上层 ONNX 量化/编译工具如果不支持符号表达式，可在加载时把第一维 hint 为 1024。
+- `mrope_position_ids_prefill_8k.onnx` 输出 `position_ids` 第三维为符号表达式 `L1 + image_seq_length + L2`（运行时 = 8192）；同上，工具如果只接受静态 shape，在加载时 hint 为 8192 即可。
+- `vision_pos_embed_interp_1k.onnx` 输出 `hidden_states_post` 仍是静态 `[1024, 1152]`，因为最后一行 `hidden_states_pre + patch_pos_embeds` 的左操作数是静态形状，broadcast 把右侧的符号 shape 锁回静态。
+
+---
+
+## 7. 两种模式的差异（`--vision_grid_mode dynamic` vs `static`）
+
+CLI 参数 `--vision_grid_mode {dynamic, static}` 决定 3 个 ★ 子图的导出方式：
+
+| 比较项 | `dynamic`（本目录） | `static`（→ `Prefill_8k_static/`） |
+|---|---|---|
+| 子图算子可见性 | **全可见**（Range/Cos/Sin/Tile/OneHot/...） | 折成查找表 + 少量末端算子 |
+| `vision_rot_pos_emb_1k` 节点 | 36 | 5（cos/sin 折成 288 KB initializer） |
+| `vision_pos_embed_interp_1k` 节点 | 84 | 21（4 角索引/权重折成常量） |
+| `mrope_position_ids_prefill_8k` 节点 | 47 | 10（position_ids 折成 192 KB initializer） |
+| 总 `unk__N` | 145 | 7（仅源码本征 unk：cu_seqlens 4 + mm_inject 3） |
+| 同一份 ONNX 喂多种 grid_thw | ✓ 支持，加载时 hint shape 即可 | ✗ 必须每个分辨率重导一份 |
+| 源码算子拓扑 1:1 对应 | ✓ | 部分折叠 |
+| 适合的下游用途 | 源码分析、Netron 可视化、量化工具加载时 hint shape | 必须 ONNX 端就静态形状的工具（老 NPU 编译器） |
+
+切换示例：
+
+```bash
+# dynamic（默认）：本目录
+python modes/qwen_3_5_MoE/export_qwen_onnx_main.py MODEL_PATH \
+  --variant vl --phase prefill --seq_len 8192 \
+  --vision_token_seq_len 1024 \
+  --vision_grid_mode dynamic        # 可省略
+
+# static：覆盖一组分辨率，每个分辨率重导一遍
+python modes/qwen_3_5_MoE/export_qwen_onnx_main.py MODEL_PATH \
+  --variant vl --phase prefill --seq_len 8192 \
+  --vision_token_seq_len 1024 \
+  --vision_grid_mode static
+# 输出 → Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k_static/
+```
