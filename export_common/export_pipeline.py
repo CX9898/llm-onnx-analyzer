@@ -115,6 +115,129 @@ def strip_initializers_to_inputs(save_path: str) -> None:
     onnx.save(model_proto, save_path)
 
 
+# Per-tensor threshold: larger initializers go to a sidecar ``*.onnx.data`` file.
+# Graph topology keeps weights as initializer → MatMul/Gemm inputs (Netron-friendly).
+EXTERNAL_DATA_TENSOR_THRESHOLD_BYTES = 1024
+
+
+def externalize_large_initializers(
+    save_path: str,
+    *,
+    size_threshold: int = EXTERNAL_DATA_TENSOR_THRESHOLD_BYTES,
+) -> bool:
+    """Move bulky initializer bytes to ``<stem>.onnx.data``; keep initializer nodes in-graph."""
+    model = onnx.load(save_path)
+    inline_bytes = sum(len(init.raw_data or b"") for init in model.graph.initializer)
+    if inline_bytes <= size_threshold:
+        return False
+
+    try:
+        from onnx.external_data_helper import convert_model_to_external_data
+    except ImportError:
+        print("    external_data: onnx.external_data_helper unavailable — keeping inline initializers")
+        return False
+
+    location = os.path.basename(save_path) + ".data"
+    convert_model_to_external_data(
+        model,
+        all_tensors_to_one_file=True,
+        location=location,
+        size_threshold=size_threshold,
+        convert_attribute=False,
+    )
+    onnx.save(model, save_path)
+    data_path = os.path.join(os.path.dirname(save_path) or ".", location)
+    data_mb = os.path.getsize(data_path) / (1 << 20) if os.path.isfile(data_path) else 0.0
+    print(f"    external_data: sidecar {location} ({data_mb:.1f} MB), initializers remain in-graph")
+    return True
+
+
+def _external_data_paths(model: onnx.ModelProto, base_dir: str) -> set[str]:
+    """Collect on-disk paths referenced by external-data tensors in *model*."""
+    paths: set[str] = set()
+
+    def add_tensor(tensor: onnx.TensorProto) -> None:
+        if tensor.data_location != onnx.TensorProto.EXTERNAL and not tensor.external_data:
+            return
+        location = next((e.value for e in tensor.external_data if e.key == "location"), None)
+        if location:
+            paths.add(os.path.normpath(os.path.join(base_dir, location)))
+
+    for init in model.graph.initializer:
+        add_tensor(init)
+    for init in model.graph.sparse_initializer:
+        add_tensor(init)
+    for node in model.graph.node:
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.TENSOR:
+                add_tensor(attr.t)
+            elif attr.type == onnx.AttributeProto.TENSORS:
+                for tensor in attr.tensors:
+                    add_tensor(tensor)
+    return paths
+
+
+def finalize_analysis_initializers(save_path: str) -> int:
+    """
+    Drop weight bytes for analysis-only exports.
+
+    Keeps ``graph.initializer`` entries (shape/dtype + MatMul/Gemm edges) but
+    removes inline ``raw_data``, external-data refs, and any external sidecar files.
+    """
+    base_dir = os.path.dirname(os.path.abspath(save_path)) or "."
+    sidecar = save_path + ".data"
+    model = onnx.load(save_path, load_external_data=True)
+    ext_paths = _external_data_paths(model, base_dir)
+    ext_paths.add(os.path.abspath(sidecar))
+
+    dropped = 0
+    for init in model.graph.initializer:
+        has_bytes = bool(init.raw_data) or init.external_data or init.data_location == onnx.TensorProto.EXTERNAL
+        if not has_bytes:
+            continue
+        init.ClearField("raw_data")
+        init.data_location = onnx.TensorProto.DEFAULT
+        while init.external_data:
+            init.external_data.pop()
+        dropped += 1
+
+    onnx.save(model, save_path)
+    removed_files = 0
+    for path in ext_paths:
+        if os.path.isfile(path):
+            os.remove(path)
+            removed_files += 1
+    if dropped:
+        print(
+            f"    analysis_weights: dropped bytes for {dropped} initializers "
+            f"(topology + shape kept; removed {removed_files} external file(s))"
+        )
+    return dropped
+
+
+def _snapshot_dir_files(base_dir: str) -> set[str]:
+    if not os.path.isdir(base_dir):
+        return set()
+    return {
+        os.path.abspath(os.path.join(base_dir, name))
+        for name in os.listdir(base_dir)
+        if os.path.isfile(os.path.join(base_dir, name))
+    }
+
+
+def _remove_export_artifact_files(save_path: str, before: set[str]) -> int:
+    """Delete intermediate external-weight files left by torch/onnxsim in *base_dir*."""
+    base_dir = os.path.dirname(os.path.abspath(save_path)) or "."
+    keep = {os.path.abspath(save_path)}
+    removed = 0
+    for path in _snapshot_dir_files(base_dir) - before - keep:
+        os.remove(path)
+        removed += 1
+    if removed:
+        print(f"    analysis_weights: removed {removed} intermediate artifact file(s)")
+    return removed
+
+
 def shape_enrich_onnx_file(
     save_path: str,
     *,
@@ -140,6 +263,9 @@ def onnx_export(
     collect_onnx_stats: bool = True,
     static_shape_propagator: StaticShapePropagator | None = None,
 ) -> None:
+    base_dir = os.path.dirname(os.path.abspath(save_path)) or "."
+    os.makedirs(base_dir, exist_ok=True)
+    dir_before = _snapshot_dir_files(base_dir)
     module.eval()
     with torch.no_grad():
         torch.onnx.export(
@@ -250,13 +376,17 @@ def onnx_export(
 
     if strip_initializers:
         strip_initializers_to_inputs(save_path)
-        print("    strip_initializers: converted all initializers to graph inputs")
+        print("    strip_initializers: converted all initializers to graph inputs (discouraged for visualization)")
         try:
             shape_enrich_onnx_file(save_path, static_shape_propagator=static_shape_propagator)
             print("    shape_inference(after strip): OK")
             shape_ok = True
         except Exception as exc:
             print(f"    shape_inference(after strip): skipped ({exc})")
+    else:
+        externalize_large_initializers(save_path)
+        finalize_analysis_initializers(save_path)
+        _remove_export_artifact_files(save_path, dir_before)
 
     file_size = os.path.getsize(save_path)
     print(f"    → {save_path}  ({file_size / (1 << 20):.1f} MB)")

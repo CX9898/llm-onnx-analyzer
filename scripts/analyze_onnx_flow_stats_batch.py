@@ -745,6 +745,8 @@ def main() -> None:
 
     for model_path in model_paths:
         result = analyze_model(model_path)
+        per_json = model_path.with_name(model_path.stem + ".flow_stats.summary.json")
+        per_json.write_text(json.dumps(result["summary"], indent=2, ensure_ascii=False), encoding="utf-8")
         io_summary = _get_graph_io_summary(model_path)
         tensor_types = _build_tensor_type_map(model_path)
         model_name = model_path.stem

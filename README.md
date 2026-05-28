@@ -2,15 +2,36 @@
 
 面向真实大模型权重的 ONNX 导出与流程分析工具集：把目标模型按 canonical 路径切成一组贴近真实执行语义的代表层 merged ONNX 子图，并对其做逐节点 MACs / 显存 / 参数占比统计。
 
-当前已接入：`Qwen3.5-MoE`（`35B-A3B`），同时支持纯文本子集导出（`qwen3.5moe`）和完整多模态导出（`qwen3.5moe-vl`，含 vision tower + 多模态注入）。`LLaDA-2.1` 占位中。
+当前已接入：`Qwen3.5-MoE`（`35B-A3B`），同时支持纯文本子集导出（`qwen3.5moe`）和完整多模态导出（`qwen3.5moe-vl`，含 vision tower + 多模态注入）。`Z-Image`（`Tongyi-MAI/Z-Image`，diffusers `ZImagePipeline`）支持 text_encode / denoise / vae_decode 三阶段代表层导出
+
+## 分析专用，非推理部署
+
+**本仓库产出的 ONNX 不用于推理部署。** 导出 ONNX 的唯一目的是**算子定量分析**——在 Netron 等工具里查看图结构，并用脚本统计 MACs / 激活显存 / 参数占比。
+
+我们关注的核心信息是：
+
+| 维度 | 说明 |
+|------|------|
+| **可视化** | 在 Netron 等工具中查看算子拓扑、节点连接、子图边界 |
+| **算子流程** | 与源码 forward 对齐的调用顺序与分支结构 |
+| **算子 dtype** | 每个算子输入 / 输出的真实 dtype（含源码里的显式 cast） |
+| **算子 shape** | 每个中间张量与权重的静态 shape（代表场景下的具体整数维） |
+
+**不关注、也不要求：**
+
+- ONNX Runtime / TensorRT 等 runtime 能否直接加载并跑通
+- 端到端数值正确性或与 PyTorch 的 bit-level 对齐
+
+**权重要嵌在算子里，不能剥离成 graph input。** 权重应以 `initializer` 形式挂在 `MatMul` / `Gemm` / `Conv` 等算子的输入边上；**不需要**保留权重数值或 ``*.onnx.data`` sidecar（分析只看拓扑、shape、dtype、参数量）。
 
 ## 项目初衷
 
 面向大模型的**定量分析**，关注模型**真实推理路径**上的：
 
-- 真实算子流程（与 `transformers` 源码同构的拓扑 / 控制流）
+- 真实算子流程（与 `transformers` / diffusers 源码同构的拓扑 / 控制流）
 - 每个张量的 **shape**
 - 每个算子的输入 / 输出 **dtype**
+- 图结构**可视化**（代表层子图可在 Netron 中逐节点展开）
 
 最终交付的 ONNX 子图必须能作为分析依据，逐节点反推 MACs、激活显存、权重占比。
 
@@ -31,12 +52,14 @@
 4. **完整真实数据流可拼接**
    所有子图按真实推理顺序衔接后，相邻子图的输出 / 输入 **shape 与 dtype 必须严格首尾对接**，整组子图等价于一条可追溯的完整 forward 数据流，不允许出现"分析意义上的孤岛"。
 
-5. **避免单图体积爆炸 / 越过 ONNX 2 GB 上限**
-   分析依赖的核心信息是**算子流 / shape / dtype / 参数数量与占比**，**不依赖**权重的具体数值。基于此目标可以接受两种处理方式，按实际权重体量自动选择：
-   - **超大权重**（典型如 MoE 的 N 个 expert 矩阵堆叠、embedding / lm_head 的 vocab × hidden 等 ≥ 数百 MB / 易冲撞 ONNX 单文件 2 GB protobuf 上限的张量）：**必须作为 graph input 暴露**，仅保留 shape 与 dtype，**不**内嵌任何数值，确保单 onnx 文件本身保持轻量、不被权重撑爆。
-   - **小到中等权重**（如 LayerNorm scale/bias、q/k/v/o_proj、router、vision tower 内部的 Conv3d / Linear 等单张 ≪ 100 MB 的张量）：允许直接以 initializer 形式 inline 真实数值，避免给每张代表层子图额外挂一长串 weight input、影响图的可读性；图体积仍然受控（单文件保持在百 MB 级以内），不会触发 protobuf 上限。
+5. **权重以 initializer 绑定算子；超大张量走 external data，禁止默认 strip 为 graph input**
+   可视化与 flow_stats 都依赖**权重作为算子输入边（initializer）** 的标准 ONNX 拓扑。权重必须保留在 `graph.initializer` 中并由 `MatMul` / `Gemm` / `Conv` 等节点引用，**不得**默认执行 `strip_initializers`（把权重改成 graph input 会严重破坏 Netron 可读性，是已知待修复的反模式）。
 
-   无论走哪种方式，**任何 initializer / input 的 shape 与 dtype 都必须与真实加载后的权重一致**，这是 MACs / 显存 / 参数占比等定量分析得以成立的前提。
+   按权重体量选择存储方式：
+   - **小到中等权重**（单张 ≪ 100 MB）：直接 inline 在 `.onnx` 文件内的 initializer 中。
+   - **超大权重**（整网 text encoder、DiT block、MoE expert 堆叠等，inline 会冲撞 protobuf ~2 GB 上限）：导出时先 brief externalize，再**丢弃权重字节**——initializer 节点与 shape/dtype 仍留在图中（Netron 可读拓扑），**不保留** ``*.onnx.data`` sidecar（分析不依赖权重数值）。
+
+   无论 inline 还是 external data，**initializer 的 shape 与 dtype 必须与真实权重一致**。分析不依赖权重具体数值，但**依赖正确的 initializer 拓扑**以便可视化与参数占比统计。
 
 6. **难以中间切断的强耦合重复结构 → 包装成自定义节点 + 单独子图**
    对于一个模块内部存在大量重复且**不便从中间切断拆分**的结构（如 `RecurrentGatedDeltaRule`、`ChunkGatedDeltaRule` 这类带状态 / 带分块循环的算子），整体作为**一个自定义算子节点**出现在父图中，仅暴露其外部 I/O 的 shape / dtype；该节点内部实现**单独导出为一份独立的 ONNX 子图**，需要下钻分析时再打开对应子图查看，避免父图被内部重复结构淹没。
@@ -68,6 +91,13 @@ python export_model.py qwen3.5moe-vl \
     --model_path /mnt/data8t/share/models/Qwen/Qwen3.5-35B-A3B
 # -> output/Qwen3_5_35B_A3B_VL_ONNX_Prefill_8k/
 # -> output/Qwen3_5_35B_A3B_VL_ONNX_Decode_8k/
+
+# Z-Image（diffusers ZImagePipeline，512² 代表场景）
+python export_model.py z-image \
+    --model_path /mnt/data8t/share/models/Tongyi-MAI/Z-Image
+# -> output/Z_Image_ONNX_512/denoise/
+# -> output/Z_Image_ONNX_512/text_encode/
+# -> output/Z_Image_ONNX_512/vae_decode/
 ```
 
 两个入口默认都跑 8k 上下文，自动同时导出 prefill + decode 两套。`qwen3.5moe-vl` 在 text 子图基础上**额外**导出 4 个 vision/MM 子图（`vision_patch_embed` / `vision_block_<idx>_repr` / `vision_patch_merger` / `mm_inject`），并且这 4 个图**只出现在 prefill 输出目录**——图像 token 在 prefill 阶段一次性写入 `inputs_embeds`，decode 阶段沿用 KV-cache 不再触发 vision tower / mm_inject，因此 vl decode 输出目录与纯文本 decode 等价（同 4 张代表层 text 主图）。
@@ -97,6 +127,8 @@ python export_model.py qwen3.5moe-vl \
 ## ONNX 流量分析
 
 `scripts/` 下两个脚本与具体模型无关，对任意 ONNX 都能跑。统计 `Forward_MACs`（仅 MatMul/Gemm/Conv/常见 Einsum）/ 输出激活字节数 / 参数 initializer 元素数。默认输出落在输入文件/输入目录的同一位置，无需手填路径。
+
+权重以 initializer（或 external data 引用的 initializer）统计参数量；仅 legacy `strip_initializers` 产物才需按 graph input shape 补全。
 
 ```bash
 # 单图逐节点 -> 与输入同目录的 <stem>.flow_stats.tsv / <stem>.flow_stats.summary.json

@@ -5,6 +5,7 @@
 
     python export_model.py qwen3.5moe    --model_path /path/to/Qwen3.5-35B-A3B
     python export_model.py qwen3.5moe-vl --model_path /path/to/Qwen3.5-35B-A3B
+    python export_model.py z-image         --model_path /path/to/Tongyi-MAI/Z-Image
 
     # 导出根目录默认 ./output，可用 --output_dir 覆盖。
 
@@ -116,10 +117,42 @@ def _export_llada_2_1(model_path: str, output_dir: Path) -> None:
     )
 
 
+def _export_z_image(model_path: str, output_dir: Path) -> None:
+    zimage_dir = _MODES_ROOT / "z_image"
+    main_script = zimage_dir / "export_z_image_onnx_main.py"
+    if not main_script.is_file():
+        raise FileNotFoundError(f"missing entry: {main_script}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    phases = ("all",)
+    phase_dir = output_dir / "Z_Image_ONNX_512"
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[export_model] z-image -> {phase_dir}")
+    _run(
+        [
+            sys.executable,
+            str(main_script),
+            model_path,
+            "--phase",
+            "all",
+            "--output_dir",
+            str(phase_dir),
+            "--image_size",
+            "512",
+            "--cap_seq",
+            "128",
+        ],
+        cwd=zimage_dir,
+        extra_pythonpath=[_REPO_ROOT, zimage_dir],
+    )
+    print("\n[export_model] z-image done.")
+
+
 _DISPATCH = {
     "qwen3.5moe": _export_qwen_3_5_moe,
     "qwen3.5moe-vl": _export_qwen_3_5_moe_vl,
     "llada2.1": _export_llada_2_1,
+    "z-image": _export_z_image,
 }
 
 

@@ -76,6 +76,174 @@ def _shape_numel(shape: list[int | str] | None) -> int | None:
     return numel
 
 
+def _concretize_shape(shape: list[int | str] | None, batch_size: int | None) -> list[int | str] | None:
+    if shape is None or batch_size is None:
+        return shape
+    out: list[int | str] = []
+    for i, d in enumerate(shape):
+        if isinstance(d, int):
+            out.append(d)
+        elif i == 0:
+            out.append(batch_size)
+        else:
+            out.append(d)
+    return out
+
+
+def _infer_batch_size(model: onnx.ModelProto, tensor_info: dict[str, dict]) -> int | None:
+    for vi in model.graph.input:
+        meta = tensor_info.get(vi.name)
+        if not meta:
+            continue
+        shape = meta.get("shape")
+        if shape and len(shape) >= 1 and isinstance(shape[0], int) and shape[0] > 0:
+            return int(shape[0])
+    return None
+
+
+_ACTIVATION_INPUT_NAMES = frozenset(
+    {
+        "hidden_states",
+        "attn_mask",
+        "rope_cos",
+        "rope_sin",
+        "adaln_input",
+        "latent",
+        "cap_feats",
+        "cap_feats_padded",
+        "timestep",
+        "input_ids",
+        "attention_mask",
+        "x_patch_feats",
+        "x_embedded",
+        "x_pos_ids",
+        "x_pad_mask",
+        "cap_embedded",
+        "cap_pos_ids",
+        "cap_pad_mask",
+        "x_tokens",
+        "cap_tokens",
+        "x_rope_cos",
+        "x_rope_sin",
+        "cap_rope_cos",
+        "cap_rope_sin",
+        "patch_output",
+        "image_patch_output",
+        "latents",
+    }
+)
+
+
+def _is_activation_graph_input(name: str) -> bool:
+    if name in _ACTIVATION_INPUT_NAMES:
+        return True
+    if name.endswith("_mask") or name.endswith("_ids"):
+        return True
+    if "rope" in name and ("cos" in name or "sin" in name):
+        return True
+    if ".weight" in name or ".bias" in name:
+        return False
+    return False
+
+
+def _refresh_tensor_meta(entry: dict) -> None:
+    shape = entry.get("shape")
+    elem_type = entry.get("elem_type") or 0
+    entry["numel"] = _shape_numel(shape)
+    entry["nbytes"] = (entry["numel"] or 0) * _dtype_nbytes(elem_type)
+
+
+def _matmul_output_shape(a_shape, b_shape) -> list[int | str] | None:
+    if a_shape is None or b_shape is None or len(a_shape) < 2 or len(b_shape) < 2:
+        return None
+    if not all(isinstance(x, int) for x in a_shape + b_shape):
+        return None
+    batch_a = a_shape[:-2]
+    batch_b = b_shape[:-2]
+    m, k = int(a_shape[-2]), int(a_shape[-1])
+    k2, n = int(b_shape[-2]), int(b_shape[-1])
+    if k != k2:
+        return None
+    if batch_a and batch_b and batch_a != batch_b:
+        if len(batch_a) == len(batch_b) == 1:
+            batch = [batch_a[0] if isinstance(batch_a[0], int) else batch_b[0]]
+        else:
+            batch = batch_a if len(batch_a) >= len(batch_b) else batch_b
+    else:
+        batch = batch_a or batch_b
+    return list(batch) + [m, n]
+
+
+def _propagate_shapes(model: onnx.ModelProto, tensor_info: dict[str, dict]) -> None:
+    """Best-effort shape propagation for stripped graphs (symbolic batch -> concrete)."""
+    batch_size = _infer_batch_size(model, tensor_info)
+    for meta in tensor_info.values():
+        meta["shape"] = _concretize_shape(meta.get("shape"), batch_size)
+        _refresh_tensor_meta(meta)
+
+    for _ in range(8):
+        changed = False
+        for node in model.graph.node:
+            input_shapes = [tensor_info.get(n, {}).get("shape") for n in node.input if n]
+            output_names = [n for n in node.output if n]
+            if not output_names:
+                continue
+
+            new_shape = None
+            if node.op_type in {"Add", "Mul", "Sub", "Div", "Where"} and input_shapes:
+                known = [s for s in input_shapes if s and all(isinstance(x, int) for x in s)]
+                if known:
+                    new_shape = list(known[0])
+            elif node.op_type == "MatMul" and len(input_shapes) >= 2:
+                new_shape = _matmul_output_shape(input_shapes[0], input_shapes[1])
+            elif node.op_type == "Gemm" and len(input_shapes) >= 2:
+                b_shape = input_shapes[1]
+                trans_b = _get_attr_int(node, "transB", 0)
+                if b_shape is not None and trans_b and len(b_shape) == 2 and all(
+                    isinstance(x, int) for x in b_shape
+                ):
+                    b_shape = [int(b_shape[1]), int(b_shape[0])]
+                new_shape = _matmul_output_shape(input_shapes[0], b_shape)
+            elif node.op_type == "Softmax" and input_shapes and input_shapes[0]:
+                new_shape = list(input_shapes[0])
+            elif node.op_type in {"LayerNormalization", "InstanceNormalization", "Sigmoid", "Tanh", "Cast"}:
+                if input_shapes and input_shapes[0]:
+                    new_shape = list(input_shapes[0])
+            elif node.op_type == "Concat":
+                axis = _get_attr_int(node, "axis", 0)
+                known = [s for s in input_shapes if s and all(isinstance(x, int) for x in s)]
+                if len(known) >= 2:
+                    new_shape = list(known[0])
+                    total = sum(int(s[axis]) for s in known)
+                    new_shape[axis] = total
+
+            if new_shape is None:
+                continue
+            for out_name in output_names:
+                meta = tensor_info.get(out_name)
+                if meta is None:
+                    meta = {"shape": None, "elem_type": None, "is_initializer": False}
+                    tensor_info[out_name] = meta
+                if meta.get("shape") != new_shape:
+                    meta["shape"] = new_shape
+                    _refresh_tensor_meta(meta)
+                    changed = True
+        if not changed:
+            break
+
+
+def _external_weight_params(model: onnx.ModelProto, tensor_info: dict[str, dict]) -> int:
+    init_names = {init.name for init in model.graph.initializer}
+    total = 0
+    for vi in model.graph.input:
+        if vi.name in init_names or _is_activation_graph_input(vi.name):
+            continue
+        meta = tensor_info.get(vi.name)
+        if meta and meta.get("numel"):
+            total += int(meta["numel"])
+    return total
+
+
 def _get_attr_int(node: onnx.NodeProto, name: str, default: int) -> int:
     for attr in node.attribute:
         if attr.name == name:
@@ -235,6 +403,7 @@ def analyze_model(model_path: Path):
     except Exception:
         pass
     tensor_info = _build_tensor_info(model)
+    _propagate_shapes(model, tensor_info)
 
     rows = []
     for idx, node in enumerate(model.graph.node):
@@ -264,7 +433,9 @@ def analyze_model(model_path: Path):
 
     total_macs = sum(r["Forward_MACs"] for r in rows)
     total_memory = sum(r["Memory"] for r in rows)
-    total_params = sum(r["Params"] for r in rows)
+    total_params_init = sum(r["Params"] for r in rows)
+    total_params_external = _external_weight_params(model, tensor_info)
+    total_params = total_params_init + total_params_external
 
     for r in rows:
         r["FPercent"] = 100.0 * r["Forward_MACs"] / total_macs if total_macs else 0.0
@@ -278,7 +449,9 @@ def analyze_model(model_path: Path):
             "node_count": len(rows),
             "total_forward_macs": total_macs,
             "total_output_memory_bytes": total_memory,
-            "total_params_initializer": total_params,
+            "total_params_initializer": total_params_init,
+            "total_params_external": total_params_external,
+            "total_params": total_params,
         },
     }
 
