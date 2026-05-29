@@ -20,7 +20,7 @@
 
 ## 1. 系统定位
 
-Z-Image 是阿里通义开源的文生图(**Text-to-Image, T2I**) 基础模型，参数量约 **6B** ，核心生成骨干为 **S3-DiT**（Scalable Single-Stream Diffusion Transformer）。
+Z-Image 是阿里通义开源的文生图(**Text-to-Image**) 基础模型，参数量约 **6B** ，核心生成骨干为 **S3-DiT**（Scalable Single-Stream Diffusion Transformer）, 它不是 FLUX/Qwen-Image 那类显式双流结构，而是把不同模态 token 早融合到同一条序列里，让每一层 self-attention 都能做跨模态交互。
 
 同赛道常见方案（Qwen-Image、FLUX、Hunyuan-Image 等）参数量多在 20B–80B。Z-Image 的设计目标是：在较小参数量下，通过架构与训练流程优化，达到可接受的生成质量与推理成本。
 
@@ -57,279 +57,238 @@ Z-Image 推理系统由三个独立权重模块串联：
 
 ---
 
-## 3. 端到端推理数据流
+## 3. Text Encoder（文本编码器）
 
-### 3.1 三阶段划分
+Text Encoder 的作用是把自然语言 prompt 转成一组条件 token。Z-Image 使用 **Qwen3-4B** 作为 Text Encoder，利用它的中英文理解能力和指令理解能力。
 
-```text
-[Phase 1: Text Encode — 每个 prompt 一次]
-  Prompt → Tokenizer → Text Encoder → caption 特征
-
-[Phase 2: Denoise — scheduler 循环 × N 步(Turbo 常用 8，Base 常用 28–50)]
-  随机噪声 latent + caption 特征 + timestep
-      → S3-DiT forward
-      → noise / velocity 预测
-      → Scheduler 更新 latent
-
-[Phase 3: VAE Decode — 去噪结束后一次]
-  干净 latent → 反 scaling → VAE decode → 图像
-```
-
-### 3.2 Denoise 循环（架构视角）
-
-Z-Image 使用 **Flow Matching** 调度（diffusers 中为 `FlowMatchEulerDiscreteScheduler`），不是 DDPM 的 ε-prediction 范式。架构上仍表现为：
-
-- 每步输入：当前 noisy latent、归一化 timestep、caption 条件。
-- 每步输出：模型预测量（经 scheduler 转换为 latent 更新）。
-- 步数：Base 模型通常数十步；Turbo 约 8 步。
-
-**Classifier-Free Guidance（CFG）** 在架构层体现为：同一步内对 cond / uncond 两路 caption 各跑一次 DiT forward，在 host 侧线性组合预测结果。Turbo 默认关闭 CFG（`guidance_scale=0`）。
-
-### 3.3 Latent 与 Token 的关系
-
-- 图像经 **VAE Encoder**（训练阶段）压缩到 latent，通道数 **16**。
-- DiT 不直接在 `[C,H,W]` 张量上做全局 Attention，而是先 **patchify**：将 latent 切为 patch token 序列。
-- 512×512 像素对应 latent 约 64×64，patch 后 image token 数约 **1024**（与分辨率、patch 配置相关）。
-
----
-
-## 4. S3-DiT 核心架构
-
-S3-DiT 是 Z-Image 的生成骨干，名称中的 **Single-Stream** 指：多种模态 token 在序列维 **concat** 后，进入**同一套** Transformer layer 做 self-attention，而不是 text / image 各走独立双流再交叉。
-
-### 4.1 与前段 MM-DiT 的关系
-
-S3-DiT 继承 **MM-DiT**（Multi-Modal Diffusion Transformer）的 single-stream concat 思路（与 Stable Diffusion 3 同族），但 Z-Image 将其扩展为可 scaling 的 6B 实现，并统一支持 T2I 与 Edit。
-
-### 4.2 内部四段结构
-
-单次 DiT forward（Basic 文生图）在架构上分为四段：
+Text Encoder 不直接生成图像，只输出 caption 特征，供后面的 S3-DiT 使用。
 
 ```text
-(1) Timestep 条件
-    t → TimestepEmbedder → adaln 向量（供后续 AdaLN 使用）
-
-(2) Patchify + 模态预处理（Modality Processor）
-    noisy latent → patch tokens ──► noise_refiner ×2  ──┐
-    caption 特征 → cap tokens   ──► context_refiner ×2 ──┤
-                                                          │
-(3) 序列融合                                          ◄───┘
-    image tokens + caption tokens → 统一序列 [S_x + S_cap, D]
-
-(4) 单流 Backbone + 输出头
-    unified layers ×30 → FinalLayer → unpatchify → 预测量
+Prompt
+  → Tokenizer / Chat Template
+  → Qwen3-4B Text Encoder
+  → caption features
 ```
 
-**Modality Processor**（各模态前的 refiner）是 Z-Image 相对「直接 concat 进 backbone」的额外设计：每个模态先经 **2 层** 轻量 Transformer block 对齐，再进入 30 层主 stack。论文动机是在 concat 前完成模态对齐，提高参数效率。
+![Qwen3 dense Text Encoder](./Qwen3_dense.png)
 
-### 4.3 关键规格（S3-DiT）
+上图可以作为 Z-Image Text Encoder 的结构参考。Prompt token 先经过 embedding 和 RotaryEmbedding（旋转位置编码），再进入多层 decoder layer。每层包含 self-attention 和 MLP，并使用 RMSNorm、残差连接和 gated MLP。Z-Image 使用这一路前向计算得到文本 token 的 hidden states。
 
-| 配置项 | 值 |
-|--------|-----|
-| 总参数量 | ~6.15B |
-| Backbone 层数 | 30 |
-| Hidden dim | 3840 |
-| Attention heads | 32 |
-| FFN 中间维 | 10240 |
-| Refiner 层数（每模态） | 2 |
-| 3D RoPE 轴维度 (d_t, d_h, d_w) | (32, 48, 48) |
-| Latent 通道 | 16 |
-| Caption 特征维 | 2560（来自 Qwen3 Text Encoder） |
+这里的 Text Encoder 只做编码。它不使用图中最上方的语言模型输出去预测下一个 token，也不在推理时生成一段新文本。Z-Image 取 Qwen3-4B 的 hidden states 作为 caption features，再交给 S3-DiT。
+
+### 3.1 输入输出
+
+输入是用户 prompt。推理时 prompt 会先被格式化成对话模板，再进入 Qwen3-4B。
+
+输出是每个文本 token 对应的 hidden state。Z-Image 不使用语言模型最后的词表 logits，也不让 Qwen 自回归生成文本。它取中间层 hidden states 作为图像生成条件。
+
+这些 caption features 进入 S3-DiT 前，会先被投影到 S3-DiT 的 hidden dimension。公开实现中 caption feature dimension 是 2560，S3-DiT hidden dimension 是 3840。
+
+### 3.2 为什么使用外置 Text Encoder
+
+文生图模型需要理解长 prompt、物体关系、风格描述、文字渲染要求和中英文混合指令。把这部分交给一个成熟的 Large Language Model（大语言模型）可以减少 DiT 主干承担的语言理解压力。
+
+这种设计和 Stable Diffusion / FLUX / Qwen-Image 类似：文本理解模块和图像生成模块分开。区别在于 Z-Image 选择 Qwen3-4B 作为轻量但能力较强的文本编码器，并通过 Prompt Enhancer（提示词增强器）补足复杂世界知识和推理型 prompt 的理解。
+
+### 3.3 和其他模型的关系
+
+Stable Diffusion 系列常用 CLIP Text Encoder 或 T5 Text Encoder。CLIP 对短文本和图文对齐有效，但长指令能力有限；T5 更适合长文本语义，但模型体积和推理成本较高。
+
+Z-Image 使用 Qwen3-4B，重点是中英文 prompt、复杂指令和文字渲染场景。它不是把 LLM 融入 DiT 内部，而是把 LLM 当作独立条件编码器。这样可以保持模块边界清晰：Text Encoder 负责理解文本，S3-DiT 负责生成图像 latent。
 
 ---
 
-## 5. Transformer Block 结构
+## 4. S3-DiT（Scalable Single-Stream Diffusion Transformer）
 
-S3-DiT 的基本重复单元为 **ZImageTransformerBlock**，在 refiner 与 backbone 中复用，差异在于是否启用 **AdaLN**（Adaptive Layer Normalization）：
+S3-DiT 是 Z-Image 的生成主干。它在 latent 空间工作，每一步接收 noisy latent、timestep 和 caption features，输出对 latent 的预测修正量。
 
-| 位置 | AdaLN | Timestep 条件 |
-|------|-------|---------------|
-| `noise_refiner` | 有 | 有 |
-| `context_refiner` | 无 | 无 |
-| `layers`（backbone ×30） | 有 | 有 |
+Z-Image 的主要架构特点集中在 S3-DiT：单流融合、多模态 token 统一建模、30 层 Transformer backbone，以及面向稳定训练的归一化和条件注入设计。
 
-单个 block 的数据路径：
+### 4.1 Single-Stream 的含义
+
+Single-Stream（单流）指文本 token、图像 latent token，以及编辑场景中的参考图像 token，会被拼接成一条统一序列，然后进入同一组 Transformer layers。
 
 ```text
-hidden [B, S, D]
-    │
-    ├─ AdaLN(timestep) → scale/gate（refiner/backbone 有 AdaLN 的 block）
-    │
-    ├─ Attention 支：
-    │     RMSNorm → ×scale → Q/K/V → QK-Norm → 3D U-RoPE
-    │     → Full Self-Attention → Out → RMSNorm → ×gate → +residual
-    │
-    └─ FFN 支：
-          RMSNorm → ×scale → FFN(D→10240→D) → RMSNorm → ×gate → +residual
+caption tokens ─┐
+image tokens   ├─ concat → unified tokens → Transformer layers
+semantic tokens┘
 ```
 
-稳定化设计（与同代 DiT 共性 + Z-Image 采用项）：
+这里没有长期独立的 text stream 和 image stream。所有 token 在同一个 self-attention 中交互。
 
-- **QK-Norm**：约束 attention 中 Q/K 幅度。
-- **Sandwich-Norm**：Attention / FFN 的输入、输出两侧各一层 RMSNorm。
-- **AdaLN-Zero 风格 gate**：scale / gate 来自 timestep 条件；gate 经 tanh，scale 为 `1 + Δ`。
-- **AdaLN 低秩分解**：共享 down-projection + 逐层 up-projection，降低条件注入参数量。
+这和一些 Dual-Stream（双流）架构不同。双流架构通常先让文本和图像分别经过自己的分支，再通过 cross-attention 或联合层交互。双流的优点是模态边界清楚；缺点是参数和计算会分散到多条路径。Z-Image 选择单流结构，目标是在 6B 左右参数量下提高跨模态参数复用率。
 
-Attention 为 **Full Self-Attention**（非 linear attention，非 cross-attention 双流）。text token 与 image token 在同一序列内互相 attend。
+### 4.2 S3-DiT 的输入序列
 
----
+普通文生图场景中，S3-DiT 处理两类 token：
 
-## 6. 位置编码：3D Unified RoPE
+- Caption token：来自 Qwen3-4B Text Encoder。
+- Image token：来自当前 noisy latent 的 patch。
 
-Z-Image 对混合序列使用 **3D Unified RoPE**（Unified Rotary Position Embedding）：
+图像不是以像素进入 S3-DiT。图像先在 VAE latent 空间表示，再被 patchify（切 patch）成 image tokens。以 1024×1024 图像为例，VAE latent 通常约为 128×128，patch size 为 2 时，image token 数约为 64×64，即 4096 个。
 
-- **Image token**：RoPE 坐标扩展在 **空间维**（height、width）及帧维（F patch）。
-- **Text token**：RoPE 坐标沿 **时间 / 序列维** 递增。
-- 不同模态 token 在同一 self-attention 中共享 RoPE 框架，但 position id 语义按模态区分。
+编辑模型 Z-Image-Edit 还会加入 reference image 的 VAE token 和 SigLIP2 semantic token。它们也会进入同一条 unified sequence。这说明 S3-DiT 的单流设计不是只服务文生图，而是用于统一 text-to-image 和 image-to-image/editing。
 
-512² 文生图代表场景：unified 序列长度约 **1152**（image ~1024 + caption ~128），hidden **3840**。
+### 4.3 Modality Processor
 
----
-
-## 7. Basic 文生图 vs Omni 编辑
-
-同一 S3-DiT 骨架支持两种运行模式：
-
-### 7.1 Basic（文生图）
-
-- 输入：单张 noisy latent + caption 特征。
-- Timestep：全局单一 embedding，所有 token 共享。
-- 序列：image tokens + caption tokens。
-
-### 7.2 Omni（Z-Image-Edit）
-
-- 输入：多张图像 latent（如 reference 干净图 + 待编辑 noisy 图）+ caption + 可选 **SigLIP** semantic 特征。
-- Timestep：reference 与 target 可用 **不同** 条件（区分 clean / noisy）；omni 模式下有 `t_noisy` / `t_clean` 双路 AdaLN。
-- RoPE：reference 与 target 空间坐标对齐，**时间维** 加 unit offset 区分。
-- 额外模态：**SigLIP-2** embedding + `siglip_refiner ×2`（仅 Edit 配置启用）。
-
-Basic 是 Omni 的子集。文生图推理走 Basic；编辑任务走 Omni。
-
----
-
-## 8. Text Encoder 与 VAE 的架构角色
-
-### 8.1 Text Encoder（Qwen3-4B）
-
-- 独立 Decoder-only LLM，**不参与** DiT 的 layer 堆叠。
-- 推理时取 **倒数第二层** hidden states 作为 caption 特征（非最后一层 LM head 输出）。
-- 支持中英文 prompt；pipeline 侧通过 chat template 格式化输入。
-- Caption 特征维 **2560**，经 DiT 内 `cap_embedder` 投影到 **3840** 后进入 refiner / backbone。
-
-### 8.2 VAE（Flux VAE）
-
-- 负责 pixel ↔ latent 转换；DiT 在 latent 空间工作。
-- Latent 通道 16；decode 前需按 `scaling_factor` / `shift_factor` 反变换。
-- VAE 与 DiT 分离训练、分离加载；推理时 VAE 只运行 decode 一次。
-
----
-
-## 9. 与同类型架构的对比
-
-### 9.1 对比维度
-
-| 维度 | Z-Image (S3-DiT) | 典型 Dual-Stream DiT（如早期 SD3/FLUX 部分实现） | 超大单体（如 Qwen-Image 20B+） |
-|------|------------------|--------------------------------------------------|--------------------------------|
-| Text/Image 交互 | Single-stream concat + self-attn | Text / Image 分离 stream，通过 cross-attn 或 joint block 交互 | 常为 dual-stream 或更大 single-stream |
-| 参数量 | ~6B | 10B–30B 常见 | 20B–80B |
-| 模态预处理 | 每模态 refiner ×2 再 concat | 部分模型直接 embed 后 concat | 因模型而异 |
-| 条件注入 | AdaLN(timestep) | AdaLN / cross-attn | 类似 AdaLN 或额外 cond stream |
-| Attention | Full self-attn，3D U-RoPE | Full 或 mixed | Full，规模更大 |
-| FFN | Dense | Dense | 部分采用 MoE |
-| Text Encoder | 外挂 Qwen3-4B | 外挂 T5/CLIP/LLM | 外挂大 LLM |
-
-### 9.2 与 LLM（如 Qwen3.5-MoE）的结构差异
-
-两者都使用 Transformer stack，但任务与数据形态不同：
-
-| | Z-Image S3-DiT | Qwen3.5-MoE 等 LLM |
-|--|----------------|---------------------|
-| 任务 | 迭代去噪（扩散） | 自回归 next-token |
-| 序列内容 | image patch + text token 混合 | 纯 text token |
-| 循环方式 | 外循环 scheduler × N 步 | 内循环每步 1 token |
-| 条件 | timestep AdaLN | 无扩散 timestep |
-| FFN | Dense | MoE（稀疏路由） |
-| 位置编码 | 3D U-RoPE（多模态） | 1D RoPE |
-| KV Cache | 每步全序列重算（无 decode cache 语义） | decode 阶段依赖 KV cache |
-
-### 9.3 Z-Image 的架构特点（归纳）
-
-1. **Single-stream early fusion**：text / image 早期 concat，每层 self-attn 全交互；参数效率高于长期维持独立双流。
-2. **两阶段模态对齐**：refiner（×2）+ backbone（×30），concat 前先做模态内预处理。
-3. **6B 规模下的 Full Attention**：未采用 linear attention 或 MoE 换规模；依靠单流与训练效率优化控制成本。
-4. **统一骨架覆盖 T2I / Edit**：Omni 模式扩展输入模态与双 timestep，不重训整套独立编辑模型结构。
-5. **外挂 Text Encoder**：DiT 本体不含 LLM 层；caption 以 token 特征注入，而非在 DiT 内嵌整段 LLM forward。
-
----
-
-## 10. 512×512 代表场景的序列规模
-
-以下数值用于理解 tensor 形状，具体以 config 与分辨率为准：
-
-| 阶段 | 关键 shape（batch=1） |
-|------|------------------------|
-| Text Encoder 输出 | caption `[128, 2560]`（padding 后；有效 token 数可变） |
-| DiT latent 输入 | `[16, 1, 64, 64]` bf16（含 frame 维） |
-| Image tokens | `[1024, 3840]` |
-| Caption tokens | `[128, 3840]` |
-| Unified 序列 | `[1152, 3840]` |
-| Denoise 输出 | noise pred `[16, 64, 64]` f32 |
-| VAE 输出 | image `[3, 512, 512]` |
-
----
-
-## 11. 架构总览图
-
-布局参考 Qwen3.5-MoE 架构图：**上方放大最重重复 block，底行为端到端主链**。
+S3-DiT 不是把所有 token 直接送入 30 层主干。不同模态会先经过轻量的 Modality Processor（模态处理器）。
 
 ```text
-┌────────────────────────────────────────────────────────────────────────────┐
-│  【放大】S3-DiT Block（backbone ×30）                                       │
-│   AdaLN(t) → RMSNorm → Single-Stream Attn(U-RoPE, QK-Norm) → FFN → residual│
-└────────────────────────────────────────────────────────────────────────────┘
-
-Prompt ──► [Qwen3 Text Encoder] ──► caption 特征 ────────────────┐
-                                                                 ├──► [Patchify]
-Noise Latent ────────────────────────────────────────────────────┘
-       │                              ┌──► X: embed + noise_refiner×2
-Timestep ──► [TimestepEmbed] ──► AdaLN│──► Cap: embed + context_refiner×2
-                                       │              │
-                                       └──────► [Concat S=1152]
-                                                      │
-                                              ┌─ S3-DiT ×30 ─┐
-                                              └──────────────┘
-                                                      │
-                                              [Final + Unpatchify]
-                                                      │
-                                              scheduler × N ──► clean latent
-                                                      │
-                                              [VAE Decode] ──► Image
+noisy latent → patchify → image processor ×2
+caption features → projection → text processor ×2
+reference image semantic features → semantic processor ×2（编辑模型）
 ```
 
+这些 processor 都由 Transformer blocks 组成。它们的作用是让不同来源的 token 在进入主干前先完成基本对齐。
+
+这个设计介于“完全分流”和“直接拼接”之间。它保留了少量模态专用处理能力，但把主要参数留给统一的 single-stream backbone。
+
+### 4.4 Backbone：30 层单流 Transformer
+
+经过模态处理后，所有 token 被拼接成 unified sequence，进入 30 层 single-stream Transformer backbone。
+
+![S3-DiT Transformer Block](./S3-DiT-Transformer_Block.jpg)
+
+上图展示的是 single-stream backbone 中一个 Transformer block 的两部分。下半部分是 Single-Stream Attention Block，上半部分是 Single-Stream FFN Block。Z-Image 的 30 层主干可以理解为重复执行这类 block。
+
+单层 block 包含两个子块：
+
+```text
+Single-Stream Attention Block
+  RMSNorm → Scale → Q/K/V → QK-Norm → U-RoPE
+  → Multi-Head Self-Attention
+  → RMSNorm → Gate → Residual Add
+
+Single-Stream FFN Block
+  RMSNorm → Scale → Feed Forward
+  → RMSNorm → Gate → Residual Add
+```
+
+Attention 负责 token 之间的信息交换。因为文本 token 和图像 token 已在同一序列中，self-attention 可以直接建模“某个文本描述”和“某个图像区域 token”之间的关系。
+
+Feed Forward（前馈网络）负责对每个 token 的 hidden state 做非线性变换。它不做 token 间通信。Z-Image 使用 gated FFN，形态类似 SwiGLU：先升维到 10240，再通过门控激活，最后投回 3840。
+
+### 4.5 Timestep 条件注入
+
+Diffusion / Flow Matching 模型每一步的噪声强度不同，所以 S3-DiT 必须知道当前 timestep。
+
+Z-Image 使用 timestep embedding 生成条件向量，并把条件注入到 Attention 和 FFN 子块中。注入方式是生成 scale 和 gate：
+
+- scale 调制归一化后的输入。
+- gate 控制子块输出写回 residual 的强度。
+
+这类设计接近 AdaLN-Zero（Adaptive Layer Normalization Zero）风格。它让模型在不同噪声阶段使用不同的特征变换方式。
+
+在编辑模型中，clean reference image 和 noisy target image 会使用不同的 time-conditioning。clean token 表示条件图像，noisy token 表示正在生成的目标图像。这样模型可以在同一个序列中区分“参考内容”和“待生成内容”。
+
+### 4.6 3D Unified RoPE
+
+Z-Image 使用 **3D Unified RoPE**（统一三维旋转位置编码）给 unified sequence 提供位置信息。
+
+Image token 使用空间坐标。它们的 RoPE 位置对应 latent patch 的 height 和 width，也包含一个类似 frame/time 的轴。
+
+Text token 沿序列维递增。它们和 image token 使用同一套 RoPE 框架，但 position id 的语义不同。
+
+编辑场景中，reference image token 和 target image token 可以共享空间坐标，但在时间轴上错开。这样模型知道两者在空间上对齐，但角色不同。
+
+### 4.7 稳定性设计
+
+S3-DiT 使用几类常见但重要的稳定化设计：
+
+- QK-Norm：对 Query / Key 做归一化，控制 attention score 的幅度。
+- Sandwich-Norm：在 Attention / FFN 的输入和输出附近使用 RMSNorm，限制激活幅度。
+- Gate：通过条件控制每个子块写回 residual 的强度。
+- Full Self-Attention：没有改成 linear attention，也没有使用 MoE。模型主要依赖单流结构和训练流程控制成本。
+
+这些设计的目标不是改变生成范式，而是让 6B 级别的 DiT 在大分辨率、多模态 token 和多阶段训练下保持稳定。
+
+### 4.8 与同类架构的区别
+
+Z-Image 和 SD3 / FLUX 一样属于 Diffusion Transformer 路线。它们都不再使用传统 U-Net 作为主干，而是在 latent token 上运行 Transformer。
+
+Z-Image 的特别之处是：
+
+- 参数量控制在约 6.15B，而不是 20B 到 80B。
+- 采用 single-stream early fusion，让 text / image token 在主干每层直接交互。
+- 使用轻量 Modality Processor，再进入共享 backbone。
+- 统一考虑 text-to-image 和 image editing，而不是为编辑任务完全另建一套架构。
+- Turbo 版本通过 few-step distillation 把推理步数降到约 8 NFE。
+
 ---
 
-## 12. 进一步阅读
+## 5. VAE Decoder（变分自编码器解码器）
 
-| 资料 | 内容 |
-|------|------|
-| `Z-Image/docs/Z-Image_paper.md` | 论文原文：S3-DiT、训练流程、Turbo 蒸馏 |
-| diffusers `pipeline_z_image.py` | 推理三阶段与 CFG / scheduler 行为 |
-| diffusers `transformer_z_image.py` | S3-DiT forward 结构与 Basic / Omni 分支 |
-| `output/Z_Image_ONNX_512/README.md` | 本仓库 ONNX 子图与架构块映射（分析用） |
+VAE Decoder 负责把 S3-DiT 生成完成的 latent 还原成 RGB 图像。Z-Image 使用的是 **Flux VAE**。
+
+S3-DiT 不直接生成像素。它生成的是 VAE latent。VAE Decoder 是最后一步。
+
+```text
+denoised latent
+  → inverse scaling / shift
+  → Flux VAE Decoder
+  → RGB image
+```
+
+### 5.1 为什么在 latent 空间生成
+
+如果直接在像素空间生成 1024×1024 图像，token 数和计算成本会很高。Latent Diffusion（潜空间扩散）的做法是先用 VAE 把图像压缩到更小的 latent 空间，再让生成模型在 latent 上工作。
+
+这样 S3-DiT 需要处理的空间分辨率更低，但仍能通过 VAE Decoder 还原出高分辨率图像。
+
+### 5.2 VAE 在推理中的角色
+
+文生图推理时，VAE Encoder 通常不参与。流程从随机 latent 噪声开始，经过 S3-DiT 多步去噪，最后由 VAE Decoder 解码。
+
+VAE Decoder 只运行一次。它不参与每一步 denoising loop。
+
+图生图和编辑场景会使用 VAE Encoder，把输入图像或参考图像编码成 latent 条件。普通 text-to-image 场景只需要 Decoder。
 
 ---
 
-## 13. 术语表
+## 6. 端到端推理流程
 
-| 术语 | 含义 |
-|------|------|
-| **S3-DiT** | Scalable Single-Stream Diffusion Transformer，Z-Image 生成骨干 |
-| **MM-DiT** | Multi-Modal DiT，多模态 token concat + transformer 范式 |
-| **Flow Matching** | 连续归一化流式生成框架；Z-Image 去噪调度基于此 |
-| **NFE** | Number of Function Evaluations，扩散推理中 DiT forward 次数 |
-| **AdaLN** | Adaptive Layer Normalization，用 timestep 等条件生成 scale / shift / gate |
-| **U-RoPE** | Unified RoPE，Z-Image 对混合序列的 3D 旋转位置编码 |
-| **CFG** | Classifier-Free Guidance，cond / uncond 预测线性组合 |
-| **Latent** | VAE 压缩空间中的图像表示，DiT 操作对象 |
-| **Patchify** | 将 latent 切分为 patch token 序列 |
-| **Omni** | 支持多图 + 编辑条件的运行模式（含 Edit） |
+从架构视角看，Z-Image 的文生图推理可以分为四步：
+
+```text
+1. Text Encode
+   Prompt → Qwen3-4B → caption features
+
+2. Latent Init
+   Gaussian noise → noisy latent
+
+3. Denoising Loop
+   noisy latent + caption features + timestep
+     → S3-DiT
+     → velocity / latent update
+     → scheduler step
+   重复 N 步
+
+4. Decode
+   denoised latent → Flux VAE Decoder → image
+```
+
+其中最重的部分是第 3 步。S3-DiT 会在每个 denoising step 运行一次。Base 模型通常需要数十步；Z-Image-Turbo 通过 distillation 把步数降低到约 8 NFE。
+
+Z-Image 使用 **Flow Matching**（流匹配）目标。模型学习从噪声 latent 到干净 latent 的速度场。推理时 scheduler 根据模型预测更新 latent。
+
+这和传统 DDPM 的 epsilon prediction 表达方式不同，但在工程理解上仍可以看成：每一步模型读取当前 noisy latent 和文本条件，预测如何把 latent 往干净图像方向推进。
+
+### 6.1 Classifier-Free Guidance
+
+Classifier-Free Guidance（无分类器引导，CFG）是一种推理时增强 prompt 约束的方法。启用 CFG 时，同一个 timestep 会计算两路结果：
+
+- conditional：带 prompt 条件。
+- unconditional：空 prompt 或 negative prompt 条件。
+
+两路预测在线性组合后再交给 scheduler。CFG 会增强文本遵循，但会增加计算量，也可能损失自然度。
+
+### 6.1 Z-Image 的整体特点
+
+Z-Image 的架构可以概括为：
+
+- Qwen3-4B 负责文本理解。
+- S3-DiT 负责 latent 空间中的跨模态融合和去噪。
+- Flux VAE 负责 latent 到图像的解码。
+- Single-stream backbone 让 text / image token 在每层直接交互。
+
+这个设计和同类 latent diffusion / diffusion transformer 模型共享基本范式，但在参数效率和单流融合上更激进。它的目标是在较小参数量下保留足够的 prompt understanding、图像质量和推理速度。
