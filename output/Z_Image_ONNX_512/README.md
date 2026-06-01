@@ -37,7 +37,7 @@ hidden [1,1152,3840] bf16          adaln_input [1,256] bf16
          ▼                                    ▼
     ┌─ Attention 支 ─────────────────────────────────┐
     │  RMSNorm → ×scale_msa                          │
-    │       → Q/K/V Linear  (32 heads, head_dim=120)     │
+    │       → Q/K/V Linear  (30 heads, head_dim=128)     │
     │       → QK-Norm (RMSNorm)                      │
     │       → 3D U-RoPE (axes [32, 48, 48], rope_dim=64)   │
     │       → Softmax Self-Attn  (S=1152 全序列)           │
