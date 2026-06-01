@@ -27,9 +27,7 @@ from z_image_export_shared import (  # noqa: E402
     DEFAULT_CAP_SEQ,
     DEFAULT_IMAGE_SIZE,
     _DIFFUSERS_SRC,
-    load_transformer,
 )
-from z_image_manifest import render_output_readme  # noqa: E402
 from z_image_text_export import export_text_encode  # noqa: E402
 from z_image_vae_export import export_vae_decode  # noqa: E402
 from z_image_flow_analyze import analyze_export_output  # noqa: E402
@@ -106,9 +104,7 @@ def main() -> None:
     profile_path.write_text(profile_to_json(profile), encoding="utf-8")
     print(f"[z-image] source profile -> {profile_path} (from real weights + forward trace)")
 
-    transformer_cfg = None
     if args.phase in ("denoise", "all"):
-        transformer_cfg = load_transformer(args.model_path)
         reset_records()
         print("\n=== denoise subgraphs ===")
         denoise_dir = out_dir if args.phase == "denoise" else os.path.join(out_dir, "denoise")
@@ -150,13 +146,6 @@ def main() -> None:
             strip_initializers=strip,
         )
         save_stats_json(vd_dir)
-
-    if transformer_cfg is None and args.phase == "all":
-        transformer_cfg = load_transformer(args.model_path)
-
-    if args.phase == "all" and transformer_cfg is not None:
-        render_output_readme(Path(out_dir), scene, profile)
-        print(f"\n[z-image] README -> {out_dir}/README.md")
 
     if args.phase == "all":
         boundary_errors = validate_onnx_directory(Path(out_dir))
